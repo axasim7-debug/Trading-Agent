@@ -35,6 +35,7 @@ class RiskManager:
         self.day: date | None = None
         self.day_start_equity = 0.0
         self.trades_today = 0
+        self._mem: dict = {}
         self.roll_day()
 
     # ---- daily state ----------------------------------------------------------------------
@@ -58,6 +59,43 @@ class RiskManager:
             self.trades_today = 0
             return True
         return False
+
+    # ---- weekly / monthly / drawdown state ---------------------------------------------------
+    def _period_start(self, key: str, equity: float) -> float:
+        if self.journal is not None:
+            v = self.journal.get_kv(self.run_id, key)
+            if v is None:
+                self.journal.set_kv(self.run_id, key, equity)
+                return equity
+            return v
+        return self._mem.setdefault(key, equity)
+
+    def _peak_equity(self, equity: float) -> float:
+        peak = self.journal.get_kv(self.run_id, "peak_equity") if self.journal is not None else self._mem.get("peak")
+        if peak is None or equity > peak:
+            peak = equity
+            if self.journal is not None:
+                self.journal.set_kv(self.run_id, "peak_equity", peak)
+            else:
+                self._mem["peak"] = peak
+        return peak
+
+    def period_state(self) -> dict:
+        now = self.broker.now()
+        eq = self.broker.account().equity
+        iso = now.isocalendar()
+        wk = self._period_start(f"week_start_equity:{iso[0]}-W{iso[1]:02d}", eq)
+        mo = self._period_start(f"month_start_equity:{now:%Y-%m}", eq)
+        peak = self._peak_equity(eq)
+        dd = 100 * (peak - eq) / peak if peak else 0.0
+        mult = 1.0
+        for threshold, m in sorted(self.cfg.drawdown_risk_tiers or []):
+            if dd >= threshold:
+                mult = m
+        return {"weekly_pnl_pct": round(100 * (eq - wk) / wk, 3) if wk else 0.0,
+                "monthly_pnl_pct": round(100 * (eq - mo) / mo, 3) if mo else 0.0,
+                "peak_equity": round(peak, 2), "drawdown_pct": round(dd, 3), "risk_multiplier": mult,
+                "effective_max_risk_per_trade_pct": round(self.cfg.max_risk_per_trade_pct * mult, 4)}
 
     def register_open(self) -> None:
         if self.journal is None:
@@ -85,6 +123,10 @@ class RiskManager:
             "currency_exposure_pct": {k: round(100 * v / base, 2)
                                       for k, v in self.currency_exposure().items() if abs(v) > 0},
             "max_currency_exposure_pct": self.cfg.max_currency_exposure_pct,
+            "weekly_loss_limit_pct": self.cfg.max_weekly_loss_pct,
+            "monthly_loss_limit_pct": self.cfg.max_monthly_loss_pct,
+            "pending_orders": len(self.broker.pending_orders()),
+            **self.period_state(),
         }
 
     def block_reason(self) -> str | None:
@@ -96,6 +138,11 @@ class RiskManager:
             return f"daily profit target reached ({pnl_pct:.2f}%) and stop_trading_at_target is on"
         if self.trades_today >= self.cfg.max_trades_per_day:
             return "max trades per day reached"
+        ps = self.period_state()
+        if ps["weekly_pnl_pct"] <= -self.cfg.max_weekly_loss_pct:
+            return f"weekly loss limit reached ({ps['weekly_pnl_pct']:.2f}%)"
+        if ps["monthly_pnl_pct"] <= -self.cfg.max_monthly_loss_pct:
+            return f"monthly loss limit reached ({ps['monthly_pnl_pct']:.2f}%)"
         return None
 
     # ---- risk maths -----------------------------------------------------------------------
@@ -113,13 +160,23 @@ class RiskManager:
         spec = self.broker.symbol_spec(p.symbol)
         return self.broker.quote_to_account(p.symbol, dist * spec.contract_size * p.volume)
 
+    def order_risk(self, o) -> float:
+        spec = self.broker.symbol_spec(o.symbol)
+        return self.broker.quote_to_account(o.symbol, abs(o.price - o.stop_loss) * spec.contract_size * o.volume)
+
+    def _exposures(self) -> list[tuple[str, Direction, float]]:
+        items = [(p.symbol, p.direction, self.position_risk(p)) for p in self.broker.positions()]
+        items += [(o.symbol, o.direction, self.order_risk(o)) for o in self.broker.pending_orders()]
+        return items
+
     def open_risk(self) -> float:
-        return sum(self.position_risk(p) for p in self.broker.positions())
+        """Risk of open positions plus pending orders (assumed to fill)."""
+        return sum(r for _, _, r in self._exposures())
 
     def currency_exposure(self, extra: tuple[str, Direction, float] | None = None) -> dict[str, float]:
         """Net money-at-risk per currency. Long EURUSD = long EUR / short USD."""
         exp: dict[str, float] = {}
-        items = [(p.symbol, p.direction, self.position_risk(p)) for p in self.broker.positions()]
+        items = self._exposures()
         if extra:
             items.append(extra)
         for sym, d, risk in items:
@@ -146,28 +203,47 @@ class RiskManager:
 
     # ---- checks ---------------------------------------------------------------------------
     def plan_order(self, symbol: str, direction: Direction, stop_loss: float,
-                   take_profit: float | None, risk_percent: float) -> OrderPlan:
+                   take_profit: float | None, risk_percent: float,
+                   order_type: str = "market", entry_price: float | None = None) -> OrderPlan:
+        """order_type: market | limit | stop. Pending orders are sized from entry_price."""
         self.roll_day()
         reasons: list[str] = []
         c = self.cfg
         spec = self.broker.symbol_spec(symbol)
         bid, ask = self.broker.quote(symbol)
-        entry = ask if direction is Direction.BUY else bid
         spread = ask - bid
+        buy = direction is Direction.BUY
 
         if (r := self.block_reason()):
             reasons.append(f"new trades blocked: {r}")
-        if not (0 < risk_percent <= c.max_risk_per_trade_pct):
-            reasons.append(f"risk_percent must be in (0, {c.max_risk_per_trade_pct}]")
+        max_risk = self.period_state()["effective_max_risk_per_trade_pct"]
+        if not (0 < risk_percent <= max_risk + 1e-12):
+            note = "" if max_risk == c.max_risk_per_trade_pct else " (reduced because of the current drawdown)"
+            reasons.append(f"risk_percent must be in (0, {max_risk}]{note}")
         if stop_loss is None:
             reasons.append("stop_loss is required")
             return OrderPlan(False, reasons=reasons)
 
-        # stop/target must be on the correct side of the exit price
-        exit_side = bid if direction is Direction.BUY else ask
-        stop_ok = stop_loss < exit_side if direction is Direction.BUY else stop_loss > exit_side
-        if not stop_ok:
-            reasons.append(f"stop_loss {stop_loss} is on the wrong side of the market (bid {bid}, ask {ask})")
+        if order_type == "market":
+            entry = ask if buy else bid
+            exit_side = bid if buy else ask
+            stop_ok = stop_loss < exit_side if buy else stop_loss > exit_side
+            if not stop_ok:
+                reasons.append(f"stop_loss {stop_loss} is on the wrong side of the market (bid {bid}, ask {ask})")
+        elif order_type in ("limit", "stop") and entry_price is not None:
+            entry = float(entry_price)
+            ref = ask if buy else bid
+            valid = {("limit", True): entry < ref, ("stop", True): entry > ref,
+                     ("limit", False): entry > ref, ("stop", False): entry < ref}[(order_type, buy)]
+            if not valid:
+                reasons.append(f"a {'buy' if buy else 'sell'} {order_type} must be "
+                               f"{'below' if (order_type == 'limit') == buy else 'above'} the current price "
+                               f"({ref}); got {entry}")
+            stop_ok = stop_loss < entry if buy else stop_loss > entry
+            if not stop_ok:
+                reasons.append(f"stop_loss {stop_loss} must be {'below' if buy else 'above'} the entry {entry}")
+        else:
+            return OrderPlan(False, reasons=["order_type must be market, limit or stop (with entry_price)"])
         stop_distance = abs(entry - stop_loss)
         rr = None
         if take_profit is None:
@@ -188,9 +264,11 @@ class RiskManager:
                 f"{stop_distance / spec.pip:.1f} pips (max ratio {c.max_spread_to_stop_ratio})")
 
         positions = self.broker.positions()
-        if len(positions) >= c.max_open_positions:
-            reasons.append(f"max open positions ({c.max_open_positions}) reached")
-        if sum(p.symbol == symbol for p in positions) >= c.max_positions_per_symbol:
+        pend = self.broker.pending_orders()
+        if len(positions) + len(pend) >= c.max_open_positions:
+            reasons.append(f"max open positions incl. pending orders ({c.max_open_positions}) reached")
+        if sum(p.symbol == symbol for p in positions) + sum(o.symbol == symbol for o in pend) \
+                >= c.max_positions_per_symbol:
             reasons.append(f"max positions per symbol ({c.max_positions_per_symbol}) reached for {symbol}")
 
         equity = self.broker.account().equity

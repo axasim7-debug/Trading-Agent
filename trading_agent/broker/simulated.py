@@ -16,8 +16,8 @@ from datetime import datetime
 import pandas as pd
 
 from ..indicators import add_indicators
-from ..models import (TIMEFRAMES, Account, ClosedTrade, Direction, OrderResult, Position,
-                      SymbolSpec)
+from ..models import (TIMEFRAMES, Account, ClosedTrade, Direction, OrderResult, PendingOrder,
+                      Position, SymbolSpec)
 from .base import Broker
 
 _AGG = {"open": "first", "high": "max", "low": "min", "close": "last",
@@ -61,6 +61,7 @@ class SimBroker(Broker):
         self._open: dict[int, Position] = {}
         self._closed: dict[int, ClosedTrade] = {}
         self._partials: dict[int, float] = {}   # realised P/L of partial closes, per ticket
+        self._pending: dict[int, PendingOrder] = {}
 
     # ---- clock ----------------------------------------------------------------------------
     def now(self) -> datetime:
@@ -72,7 +73,9 @@ class SimBroker(Broker):
         t = self.timeline[self._i]
         for sym, df in self.data.items():
             if t in df.index:
-                self._process_bar(sym, df.loc[t])
+                bar = df.loc[t]
+                self._process_pending(sym, bar)   # fills first; a stop hit in the same bar still counts
+                self._process_bar(sym, bar)
         if self._i + 1 >= len(self.timeline):
             return False
         self._i += 1
@@ -183,6 +186,47 @@ class SimBroker(Broker):
         self._close(p, price, reason)
         return OrderResult(True, ticket=ticket, price=price)
 
+    def place_pending(self, symbol, direction, order_type, price, volume, stop_loss, take_profit,
+                      expires=None, comment=""):
+        if symbol not in self.data:
+            return OrderResult(False, message=f"Unknown symbol {symbol}")
+        ticket = next(self._tickets)
+        self._pending[ticket] = PendingOrder(ticket, symbol, direction, order_type, price, volume,
+                                             stop_loss, take_profit, self.now(), expires)
+        return OrderResult(True, ticket=ticket, price=price, volume=volume)
+
+    def pending_orders(self):
+        return list(self._pending.values())
+
+    def cancel_pending(self, ticket):
+        if self._pending.pop(ticket, None) is None:
+            return OrderResult(False, message=f"No pending order {ticket}")
+        return OrderResult(True, ticket=ticket)
+
+    def _process_pending(self, symbol: str, bar: pd.Series) -> None:
+        s = self._spread_price(symbol, bar)
+        o, h, l = float(bar["open"]), float(bar["high"]), float(bar["low"])
+        for po in [x for x in self._pending.values() if x.symbol == symbol]:
+            if po.expires is not None and self.now() >= po.expires:
+                del self._pending[po.ticket]
+                continue
+            fill = None
+            if po.direction is Direction.BUY:          # buys fill at ask = bid + spread
+                if po.order_type == "limit" and l + s <= po.price:
+                    fill = min(po.price, o + s)
+                elif po.order_type == "stop" and h + s >= po.price:
+                    fill = max(po.price, o + s)
+            else:                                       # sells fill at bid
+                if po.order_type == "limit" and h >= po.price:
+                    fill = max(po.price, o)
+                elif po.order_type == "stop" and l <= po.price:
+                    fill = min(po.price, o)
+            if fill is not None:
+                del self._pending[po.ticket]
+                # MT5-style: the position keeps the order's ticket
+                self._open[po.ticket] = Position(po.ticket, symbol, po.direction, po.volume, fill,
+                                                 po.stop_loss, po.take_profit, self.now())
+
     def close_partial(self, ticket, volume):
         p = self._open.get(ticket)
         if p is None:
@@ -202,6 +246,7 @@ class SimBroker(Broker):
         return OrderResult(True, ticket=ticket, price=price, volume=volume)
 
     def close_all(self, reason: str = "end_of_test") -> None:
+        self._pending.clear()
         for t in list(self._open):
             self.close_position(t, reason)
 

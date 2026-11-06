@@ -83,6 +83,28 @@ Windows Task Scheduler ──► scripts\run_routine.ps1 ──► claude -p (ا
 - **في كل دورة** يستدعي الوكيل `scan_setups` فيرى الإشارات مع "بطاقة الأفضلية"، ويحدد حجم المخاطرة على أساسها.
 - **على بيانات عشوائية** تخرج كل الاستراتيجيات بلا أفضلية معتمدة. هذا اختبار أن النظام لا يخدع نفسه.
 
+### أدوات المتداول المحترف (30 أداة)
+| المجال | الأدوات |
+|---|---|
+| التنفيذ | `open_trade`، `place_pending_order` (Limit/Stop مع انتهاء صلاحية)، `cancel_pending_order`، `modify_trade`، `close_trade`، `set_trade_management` |
+| الرؤية | `view_chart` (صورة الشارت مع المستويات والصفقات والتنبيهات)، `get_market_structure` (القمم والقيعان، مناطق الدعم والمقاومة، قمم وقيعان اليوم والأسبوع السابق، نطاق آسيا، المدى اليومي المتوسط)، `get_candles`، `get_market_overview` |
+| السياق | `get_intermarket` (عوائد 2y و10y ومنحناها، الدولار، VIX، النفط، S&P)، `get_positioning` (تقارير COT ونسب عملاء OANDA)، `get_economic_calendar`، والبحث في الويب |
+| الأفضلية | `scan_setups` مع بطاقة الأفضلية، `get_edge_stats` |
+| المخاطر | تقليل المخاطرة تلقائيًا عند التراجع، حدود يومية وأسبوعية وشهرية، تعرض العملات يشمل الأوامر المعلّقة، منع الدخول وقت الأخبار |
+| القياس | `get_performance_diagnostics`: صدق احتمالات الوكيل (Brier)، الإشارات المأخوذة مقابل المتروكة (سجل الظل)، أقصى ربح وأقصى خسارة لكل صفقة (MAE/MFE) |
+| الذاكرة | الخطط اليومية والأسبوعية، الملاحظات، ملخصات الدورات، التنبيهات |
+
+### متغيرات بيئة اختيارية
+```powershell
+setx TELEGRAM_BOT_TOKEN "..." ; setx TELEGRAM_CHAT_ID "..."   # إشعارات على جوالك (من @BotFather)
+setx OANDA_API_TOKEN "..."                                  # نسب مراكز عملاء OANDA (حسابك > Manage API Access)
+setx FRED_API_KEY "..."                                     # اختياري: الـ API الرسمي لبيانات FRED (مجاني)
+```
+بدون هذه المتغيرات يعمل كل شيء، وتعيد الأداة المعنية رسالة توضح ما ينقصها.
+
+`research` يسحب التاريخ من MT5 تلقائيًا ويضيف الجديد فقط. للوصول لسنوات من البيانات، اضبط في MT5 الخيار:
+Tools ← Options ← Charts ← Max bars in chart = Unlimited
+
 ### الإعداد على Windows (مرة واحدة)
 ```powershell
 git clone <repo> ; cd Trading-Agent

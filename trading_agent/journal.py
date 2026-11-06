@@ -25,6 +25,15 @@ CREATE TABLE IF NOT EXISTS equity (
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, symbol TEXT, condition TEXT, price REAL,
     note TEXT, created TEXT, expires TEXT, status TEXT, triggered_at TEXT, trigger_price REAL);
+CREATE TABLE IF NOT EXISTS orders (
+    run_id INTEGER, ticket INTEGER, symbol TEXT, direction TEXT, order_type TEXT, price REAL,
+    volume REAL, stop_loss REAL, take_profit REAL, risk REAL, created TEXT, expires TEXT,
+    status TEXT, setup TEXT, reasoning TEXT, win_probability REAL, PRIMARY KEY (run_id, ticket));
+CREATE TABLE IF NOT EXISTS signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, bar_time TEXT, symbol TEXT, setup TEXT,
+    direction INTEGER, ref_price REAL, stop REAL, target REAL, session TEXT, regime TEXT,
+    validated INTEGER, taken INTEGER DEFAULT 0, ticket INTEGER, outcome_r REAL, evaluated INTEGER DEFAULT 0,
+    UNIQUE (run_id, bar_time, symbol, setup, direction));
 CREATE TABLE IF NOT EXISTS kv (
     run_id INTEGER, key TEXT, value TEXT, updated TEXT, PRIMARY KEY (run_id, key));
 """
@@ -39,6 +48,16 @@ class Journal:
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=30)  # callers serialise access
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a journal was first created."""
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(trades)")}
+        for name, typ in (("win_probability", "REAL"), ("mae_r", "REAL"), ("mfe_r", "REAL"),
+                          ("entry_type", "TEXT")):
+            if name not in cols:
+                self.db.execute(f"ALTER TABLE trades ADD COLUMN {name} {typ}")
+        self.db.commit()
 
     # ---- runs -----------------------------------------------------------------------------
     def start_run(self, mode: str, agent: str, label: str = "", config: dict | None = None) -> int:
@@ -98,11 +117,65 @@ class Journal:
 
     # ---- trades ---------------------------------------------------------------------------
     def record_open(self, run_id, ticket, symbol, direction, volume, entry, sl, tp, risk,
-                    open_time, setup, reasoning):
+                    open_time, setup, reasoning, win_probability=None, entry_type="market"):
         self.db.execute(
             "INSERT OR REPLACE INTO trades (run_id, ticket, symbol, direction, volume, entry, stop_loss,"
-            " take_profit, initial_risk, open_time, setup, reasoning) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (run_id, ticket, symbol, direction, volume, entry, sl, tp, risk, _ts(open_time), setup, reasoning))
+            " take_profit, initial_risk, open_time, setup, reasoning, win_probability, entry_type)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, ticket, symbol, direction, volume, entry, sl, tp, risk, _ts(open_time), setup, reasoning,
+             win_probability, entry_type))
+        self.db.commit()
+
+    def set_excursions(self, run_id, ticket, mae_r, mfe_r):
+        self.db.execute("UPDATE trades SET mae_r=?, mfe_r=? WHERE run_id=? AND ticket=?",
+                        (mae_r, mfe_r, run_id, ticket))
+        self.db.commit()
+
+    # ---- pending orders --------------------------------------------------------------------
+    def record_order(self, run_id, ticket, symbol, direction, order_type, price, volume, sl, tp, risk,
+                     created, expires, setup, reasoning, win_probability):
+        self.db.execute("INSERT OR REPLACE INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?,?,?)",
+                        (run_id, ticket, symbol, direction, order_type, price, volume, sl, tp, risk,
+                         _ts(created), _ts(expires) if expires else None, setup, reasoning, win_probability))
+        self.db.commit()
+
+    def orders(self, run_id, status: str | None = "pending") -> list[dict]:
+        q, params = "SELECT * FROM orders WHERE run_id=?", [run_id]
+        if status:
+            q += " AND status=?"
+            params.append(status)
+        return [dict(r) for r in self.db.execute(q, params)]
+
+    def set_order_status(self, run_id, ticket, status):
+        self.db.execute("UPDATE orders SET status=? WHERE run_id=? AND ticket=?", (status, run_id, ticket))
+        self.db.commit()
+
+    # ---- shadow book of playbook signals ---------------------------------------------------
+    def record_signal(self, run_id, s: dict, validated: bool) -> None:
+        self.db.execute(
+            "INSERT OR IGNORE INTO signals (run_id, bar_time, symbol, setup, direction, ref_price, stop, target,"
+            " session, regime, validated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, _ts(s["bar_time"]), s["symbol"], s["setup"], s["dir"], s["ref_close"], s["suggested_stop"],
+             s["suggested_target"], s["session"], s["regime"], int(validated)))
+        self.db.commit()
+
+    def mark_signal_taken(self, run_id, symbol, setup, direction: int, ticket) -> None:
+        row = self.db.execute(
+            "SELECT id FROM signals WHERE run_id=? AND symbol=? AND setup=? AND direction=? AND taken=0"
+            " ORDER BY id DESC LIMIT 1", (run_id, symbol, setup, direction)).fetchone()
+        if row:
+            self.db.execute("UPDATE signals SET taken=1, ticket=? WHERE id=?", (ticket, row["id"]))
+            self.db.commit()
+
+    def signals(self, run_id, evaluated: bool | None = None) -> list[dict]:
+        q, params = "SELECT * FROM signals WHERE run_id=?", [run_id]
+        if evaluated is not None:
+            q += " AND evaluated=?"
+            params.append(int(evaluated))
+        return [dict(r) for r in self.db.execute(q + " ORDER BY id", params)]
+
+    def set_signal_outcome(self, signal_id, r):
+        self.db.execute("UPDATE signals SET outcome_r=?, evaluated=1 WHERE id=?", (r, signal_id))
         self.db.commit()
 
     def update_levels(self, run_id, ticket, sl=None, tp=None):
@@ -116,9 +189,12 @@ class Journal:
         self.db.execute("UPDATE trades SET close_reasoning=? WHERE run_id=? AND ticket=?", (text, run_id, ticket))
         self.db.commit()
 
-    def record_close(self, run_id, ct) -> None:
-        row = self.db.execute("SELECT initial_risk FROM trades WHERE run_id=? AND ticket=?",
+    def record_close(self, run_id, ct) -> bool:
+        """Returns True if this call closed a trade that was open in the journal."""
+        row = self.db.execute("SELECT initial_risk, close_time FROM trades WHERE run_id=? AND ticket=?",
                               (run_id, ct.ticket)).fetchone()
+        if row and row["close_time"] is not None:
+            return False
         risk = row["initial_risk"] if row else None
         r_mult = ct.profit / risk if risk else None
         self.db.execute(
@@ -126,6 +202,7 @@ class Journal:
             " WHERE run_id=? AND ticket=?",
             (_ts(ct.close_time), ct.exit_price, ct.profit, r_mult, ct.close_reason, run_id, ct.ticket))
         self.db.commit()
+        return row is not None
 
     def open_tickets(self, run_id) -> list[int]:
         rows = self.db.execute("SELECT ticket FROM trades WHERE run_id=? AND close_time IS NULL", (run_id,))

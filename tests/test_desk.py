@@ -82,7 +82,8 @@ def test_mcp_server_exposes_tools(tmp_path, monkeypatch):
         names = {t.name for t in await srv.list_tools()}
         assert {"open_trade", "get_economic_calendar", "save_plan", "log_cycle"} <= names
         r = await srv.call_tool("open_trade", {"symbol": "XXXYYY", "direction": "buy", "stop_loss": 1.0,
-                                               "risk_percent": 0.5, "setup": "s", "reasoning": "r"})
+                                               "risk_percent": 0.5, "setup": "s", "reasoning": "r",
+                                               "win_probability": 0.5})
         assert r.content[0].text.startswith("ERROR")
         r = await srv.call_tool("save_plan", {"scope": "daily", "plan": "خطة"})
         assert "saved" in r.content[0].text

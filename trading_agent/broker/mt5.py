@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from ..config import DEFAULT_SYMBOLS, Config
-from ..models import Account, ClosedTrade, Direction, OrderResult, Position, SymbolSpec
+from ..models import Account, ClosedTrade, Direction, OrderResult, PendingOrder, Position, SymbolSpec
 from .base import Broker
 
 
@@ -174,6 +174,42 @@ class MT5Broker(Broker):  # pragma: no cover - needs a live terminal
             "magic": self.cfg.mt5.magic,
         }
         return self._send(req)
+
+    def place_pending(self, symbol, direction, order_type, price, volume, stop_loss, take_profit,
+                      expires=None, comment=""):
+        bs = self._sym(symbol)
+        m = self.mt5
+        types = {(Direction.BUY, "limit"): m.ORDER_TYPE_BUY_LIMIT, (Direction.BUY, "stop"): m.ORDER_TYPE_BUY_STOP,
+                 (Direction.SELL, "limit"): m.ORDER_TYPE_SELL_LIMIT, (Direction.SELL, "stop"): m.ORDER_TYPE_SELL_STOP}
+        req = {
+            "action": m.TRADE_ACTION_PENDING, "symbol": bs, "volume": float(volume),
+            "type": types[(direction, order_type)], "price": float(price), "sl": float(stop_loss),
+            "tp": float(take_profit or 0.0), "magic": self.cfg.mt5.magic, "comment": comment[:31],
+            "type_filling": m.ORDER_FILLING_RETURN,
+        }
+        if expires is not None:
+            req["type_time"] = m.ORDER_TIME_SPECIFIED
+            req["expiration"] = int(expires.replace(tzinfo=timezone.utc).timestamp())  # server time
+        else:
+            req["type_time"] = m.ORDER_TIME_GTC
+        return self._send(req)
+
+    def pending_orders(self):
+        m = self.mt5
+        out = []
+        names = {m.ORDER_TYPE_BUY_LIMIT: (Direction.BUY, "limit"), m.ORDER_TYPE_BUY_STOP: (Direction.BUY, "stop"),
+                 m.ORDER_TYPE_SELL_LIMIT: (Direction.SELL, "limit"), m.ORDER_TYPE_SELL_STOP: (Direction.SELL, "stop")}
+        for o in m.orders_get() or []:
+            if o.magic != self.cfg.mt5.magic or o.type not in names:
+                continue
+            d, kind = names[o.type]
+            ts = lambda x: datetime.fromtimestamp(x, tz=timezone.utc).replace(tzinfo=None) if x else None
+            out.append(PendingOrder(o.ticket, self._unsym(o.symbol), d, kind, o.price_open, o.volume_current,
+                                    o.sl, o.tp or None, ts(o.time_setup), ts(o.time_expiration)))
+        return out
+
+    def cancel_pending(self, ticket):
+        return self._send({"action": self.mt5.TRADE_ACTION_REMOVE, "order": int(ticket)})
 
     def close_partial(self, ticket, volume):
         p = self.position(ticket)

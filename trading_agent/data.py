@@ -43,10 +43,41 @@ def load_symbols(data_dir: str, symbols: list[str], timeframe: str) -> dict[str,
         p = data_path(data_dir, s, timeframe)
         if not p.exists():
             raise FileNotFoundError(
-                f"Missing {p}. Download it with `python -m trading_agent download` on the MT5 machine, "
+                f"Missing {p}. On the MT5 machine `python -m trading_agent research` fetches it automatically, "
                 f"or export bars from MT5 (View > Symbols > Bars > Export).")
         out[s] = load_csv(p)
     return out
+
+
+def mt5_available() -> bool:
+    try:
+        import MetaTrader5  # noqa: F401  type: ignore
+        return True
+    except ImportError:
+        return False
+
+
+def update_history(cfg, timeframe: str, bars: int) -> list[Path]:  # pragma: no cover - needs MT5
+    """Fetch history from MT5 and MERGE it into the local cache (keeps older bars already saved).
+    Note: how far back MT5 can go depends on the terminal setting Tools > Options > Charts >
+    'Max bars in chart' - set it to Unlimited for multi-year research."""
+    from .broker.mt5 import MT5Broker
+    broker = MT5Broker(cfg)
+    Path(cfg.backtest.data_dir).mkdir(parents=True, exist_ok=True)
+    written = []
+    try:
+        for s in cfg.watchlist:
+            new = broker.get_bars(s, timeframe, bars)
+            p = data_path(cfg.backtest.data_dir, s, timeframe)
+            if p.exists():
+                old = load_csv(p)
+                new = pd.concat([old, new])
+                new = new[~new.index.duplicated(keep="last")].sort_index()
+            new.reset_index(names="time").to_csv(p, index=False)
+            written.append(p)
+    finally:
+        broker.shutdown()
+    return written
 
 
 def download_from_mt5(cfg, timeframe: str, bars: int) -> list[Path]:  # pragma: no cover - needs MT5

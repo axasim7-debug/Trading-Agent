@@ -37,6 +37,10 @@ class RiskConfig:
     news_blackout_minutes_before: int = 30    # no new trades on a currency this close to a high-impact release
     news_blackout_minutes_after: int = 15
     news_blackout_min_impact: str = "High"
+    max_weekly_loss_pct: float = 5.0
+    max_monthly_loss_pct: float = 8.0
+    # Risk is cut automatically in drawdown: [drawdown % from peak, multiplier]
+    drawdown_risk_tiers: list = field(default_factory=lambda: [[5.0, 0.5], [10.0, 0.25]])
 
 
 @dataclass
@@ -98,6 +102,15 @@ class ResearchConfig:
 
 
 @dataclass
+class ContextConfig:
+    # Related instruments on YOUR broker, label -> broker symbol (names differ per broker; check MT5 Market Watch)
+    intermarket_symbols: dict = field(default_factory=dict)   # e.g. {"US500": "US500", "DXY": "USDX", "OIL": "WTICO"}
+    oanda_practice: bool = True        # OANDA position book from the practice API (needs OANDA_API_TOKEN)
+    cache_dir: str = "cache"
+    notifications: bool = True         # Telegram, if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set
+
+
+@dataclass
 class Config:
     watchlist: list[str] = field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"])
     decision_timeframe: str = "H1"
@@ -109,6 +122,7 @@ class Config:
     mt5: MT5Config = field(default_factory=MT5Config)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
     symbols: dict[str, SymbolSpec] = field(default_factory=dict)
 
     def spec(self, symbol: str) -> SymbolSpec:
@@ -143,6 +157,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         mt5=_fill(MT5Config, raw.get("mt5")),
         watchdog=_fill(WatchdogConfig, raw.get("watchdog")),
         research=_fill(ResearchConfig, raw.get("research")),
+        context=_fill(ContextConfig, raw.get("context")),
     )
     for name, spec in (raw.get("symbols") or {}).items():
         merged = {**DEFAULT_SYMBOLS.get(name, {}), **(spec or {})}

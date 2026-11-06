@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from ..models import Account, ClosedTrade, Direction, OrderResult, Position, SymbolSpec
+from ..models import Account, ClosedTrade, Direction, OrderResult, PendingOrder, Position, SymbolSpec
 
 
 class Broker(ABC):
@@ -43,6 +43,17 @@ class Broker(ABC):
 
     @abstractmethod
     def close_position(self, ticket: int) -> OrderResult: ...
+
+    # ---- pending orders (limit / stop entries) ----------------------------------------------
+    def place_pending(self, symbol: str, direction: Direction, order_type: str, price: float, volume: float,
+                      stop_loss: float, take_profit: float | None, expires=None, comment: str = "") -> OrderResult:
+        return OrderResult(False, message="pending orders not supported by this broker")
+
+    def pending_orders(self) -> list[PendingOrder]:
+        return []
+
+    def cancel_pending(self, ticket: int) -> OrderResult:
+        return OrderResult(False, message="pending orders not supported by this broker")
 
     def close_partial(self, ticket: int, volume: float) -> OrderResult:
         return OrderResult(False, message="partial close not supported by this broker")

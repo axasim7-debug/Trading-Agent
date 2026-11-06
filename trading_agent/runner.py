@@ -46,10 +46,7 @@ class Session:
 
     # ---- bookkeeping ------------------------------------------------------------------------
     def sync_closed(self) -> None:
-        for ticket in self.journal.open_tickets(self.run_id):
-            ct = self.broker.closed_trade(ticket)
-            if ct is not None:
-                self.journal.record_close(self.run_id, ct)
+        self.watchdog.sync.run()
 
     def _t(self, t):
         return fmt_time(t, self.hide_dates)

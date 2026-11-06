@@ -14,8 +14,10 @@ Review today's trading after the New York close, following CLAUDE.md. Do not ope
    - Execution: entry timing, stop placement, management.
    - Outcome: the R result. A good process with a loss is still a good trade.
 3. Compare the day with the daily plan: did you follow it? Missed valid setups? Took unplanned trades?
-4. Look at per-setup statistics. Flag any setup with a negative average R over a meaningful sample.
-5. Save at most 2 notes with `save_note`, only for lessons supported by several trades (cite the
+4. `get_performance_diagnostics`: calibration of today's win probabilities, signals skipped vs taken,
+   MAE/MFE (were stops too tight / exits too early?).
+5. Look at per-setup statistics. Flag any setup with a negative average R over a meaningful sample.
+6. Save at most 2 notes with `save_note`, only for lessons supported by several trades (cite the
    evidence: number of trades, average R).
-6. `log_cycle` (kind `review`) in Arabic: day P/L in % and R, grades, rule breaks (if any), lessons,
+7. `log_cycle` (kind `review`) in Arabic: day P/L in % and R, grades, rule breaks (if any), lessons,
    and what to watch tomorrow. Print the same review.

@@ -22,6 +22,8 @@ from .agent.tools import ToolExecutor
 from .config import load_config
 from .econ_calendar import EconomicCalendar
 from .journal import Journal
+from .diagnostics import Sync
+from .notifier import Notifier
 from .risk import RiskManager
 
 Sym = Annotated[str, Field(description="Watchlist symbol, e.g. EURUSD")]
@@ -46,13 +48,16 @@ def build_desk(config_path: str, broker_kind: str) -> ToolExecutor:
     calendar = EconomicCalendar(cache_path=os.path.join("cache", "calendar_thisweek.json"))
     risk = RiskManager(cfg.risk, broker, cfg.commission_per_lot, journal=journal, run_id=run_id,
                        calendar=calendar if broker_kind == "mt5" else None)
+    notifier = Notifier(enabled=cfg.context.notifications and broker_kind == "mt5")
     return ToolExecutor(broker, risk, journal, run_id, cfg.watchlist, hide_dates=False, calendar=calendar,
                         default_management=cfg.watchdog.default_management,
-                        stats_path=cfg.research.stats_path)
+                        stats_path=cfg.research.stats_path, notifier=notifier,
+                        intermarket_symbols=cfg.context.intermarket_symbols,
+                        oanda_practice=cfg.context.oanda_practice, cache_dir=cfg.context.cache_dir)
 
 
 def create_server(desk: ToolExecutor):
-    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver import Image, MCPServer
 
     srv = MCPServer(
         "trading",
@@ -61,15 +66,13 @@ def create_server(desk: ToolExecutor):
     )
 
     lock = threading.Lock()  # tools run in worker threads; MT5 and SQLite need serial access
+    sync = Sync(desk.broker, desk.journal, desk.run_id, desk.notifier, desk.default_management)
 
     def call(name: str, **args) -> str:
         with lock:
             try:
-                # Keep the journal in sync with stops/targets hit since the last call.
-                for ticket in desk.journal.open_tickets(desk.run_id):
-                    ct = desk.broker.closed_trade(ticket)
-                    if ct is not None:
-                        desk.journal.record_close(desk.run_id, ct)
+                # Keep the journal in sync: pending fills, stops/targets hit since the last call.
+                sync.run()
                 args = {k: v for k, v in args.items() if v is not None}
                 text, is_err = desk.execute(name, args)
             except Exception as e:  # never crash the server; tell the model what went wrong
@@ -122,11 +125,81 @@ def create_server(desk: ToolExecutor):
                    risk_percent: Annotated[float, Field(description="Percent of equity lost if the stop is hit")],
                    setup: Annotated[str, Field(description="Playbook setup tag")],
                    reasoning: Annotated[str, Field(description="Thesis, confluence, catalyst, invalidation, target logic")],
+                   win_probability: Annotated[float, Field(ge=0.05, le=0.95, description="Your honest probability that this trade ends in profit (calibration is tracked)")],
                    take_profit: Annotated[float | None, Field(description="Absolute price (optional)")] = None) -> str:
         """Open a market order. Size is computed from risk_percent and the stop distance. The risk manager
-        may reject it (limits, exposure, news blackout); a rejection is final for that idea."""
+        may reject it (limits, exposure, news blackout, drawdown); a rejection is final for that idea."""
         return call("open_trade", symbol=symbol, direction=direction, stop_loss=stop_loss,
-                    risk_percent=risk_percent, setup=setup, reasoning=reasoning, take_profit=take_profit)
+                    risk_percent=risk_percent, setup=setup, reasoning=reasoning, take_profit=take_profit,
+                    win_probability=win_probability)
+
+    @srv.tool()
+    def place_pending_order(symbol: Sym,
+                            direction: Annotated[str, Field(description="buy or sell")],
+                            entry_type: Annotated[str, Field(description="limit (buy below / sell above price) or stop (buy above / sell below price)")],
+                            entry_price: float,
+                            stop_loss: float,
+                            risk_percent: float,
+                            setup: str,
+                            reasoning: str,
+                            win_probability: Annotated[float, Field(ge=0.05, le=0.95)],
+                            take_profit: float | None = None,
+                            expiry_hours: Annotated[float, Field(ge=0.5, le=120)] = 24) -> str:
+        """Place a limit or stop entry at your level instead of chasing price. Sized now from the stop
+        distance; counts toward open risk and exposure while pending. Expires automatically."""
+        return call("place_pending_order", symbol=symbol, direction=direction, entry_type=entry_type,
+                    entry_price=entry_price, stop_loss=stop_loss, risk_percent=risk_percent, setup=setup,
+                    reasoning=reasoning, take_profit=take_profit, expiry_hours=expiry_hours,
+                    win_probability=win_probability)
+
+    @srv.tool()
+    def list_pending_orders() -> str:
+        """Pending limit/stop orders that have not filled yet."""
+        return call("list_pending_orders")
+
+    @srv.tool()
+    def cancel_pending_order(ticket: int, reasoning: str) -> str:
+        """Cancel a pending order (e.g. the setup was invalidated before fill)."""
+        return call("cancel_pending_order", ticket=ticket, reasoning=reasoning)
+
+    @srv.tool()
+    def get_market_structure(symbol: Sym,
+                             timeframe: Annotated[str, Field(description="M15, H1, H4 or D1")] = "H4") -> str:
+        """Swing structure (HH/HL), support/resistance zones with touch counts and distance in ATR,
+        previous day/week high-low, Asia range, ADR and % of ADR used today."""
+        return call("get_market_structure", symbol=symbol, timeframe=timeframe)
+
+    @srv.tool()
+    def view_chart(symbol: Sym,
+                   timeframe: Annotated[str, Field(description="M15, H1, H4 or D1")] = "H1",
+                   count: Annotated[int, Field(ge=30, le=300)] = 120,
+                   show_levels: bool = True, bollinger: bool = False):
+        """Look at the chart as an image: candles, EMA20/50/200, RSI, key structure levels, your
+        positions (entry/SL/TP), pending orders and alerts."""
+        with lock:
+            try:
+                png = desk.chart_png(symbol, timeframe, count, show_levels, bollinger)
+            except Exception as e:
+                return f"ERROR: {type(e).__name__}: {e}"
+        return Image(data=png, format="png")
+
+    @srv.tool()
+    def get_intermarket() -> str:
+        """Related markets and macro: US 2y/10y yields and curve, broad dollar, VIX, oil, S&P 500 (FRED,
+        daily), plus live prices of related instruments on your broker if configured."""
+        return call("get_intermarket")
+
+    @srv.tool()
+    def get_positioning(symbol: Sym) -> str:
+        """Who is positioned where: CFTC COT (leveraged funds / managed money) for both currencies,
+        and OANDA retail long/short % (contrarian when extreme)."""
+        return call("get_positioning", symbol=symbol)
+
+    @srv.tool()
+    def get_performance_diagnostics() -> str:
+        """Is your judgement adding value? Calibration of your win probabilities (Brier score),
+        signals taken vs skipped (shadow book), MAE/MFE of trades, drawdown and risk multiplier."""
+        return call("get_performance_diagnostics")
 
     @srv.tool()
     def modify_trade(ticket: int, reasoning: str, stop_loss: float | None = None,

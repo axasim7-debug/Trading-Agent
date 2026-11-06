@@ -74,6 +74,8 @@ TOOL_SCHEMAS: list[dict] = [
                 "risk_percent": {"type": "number", "description": "Percent of equity to risk if the stop is hit."},
                 "setup": {"type": "string", "description": "Short tag for the setup type, e.g. 'trend-pullback-H1'."},
                 "reasoning": {"type": "string", "description": "Thesis, confluence, and what would invalidate it."},
+                "win_probability": {"type": "number", "minimum": 0.05, "maximum": 0.95,
+                                    "description": "Your honest probability that the trade ends in profit."},
             },
             "required": ["symbol", "direction", "stop_loss", "risk_percent", "setup", "reasoning"],
             "additionalProperties": False,
@@ -202,7 +204,13 @@ class ToolError(Exception):
 class ToolExecutor:
     def __init__(self, broker: Broker, risk: RiskManager, journal: Journal, run_id: int,
                  watchlist: list[str], hide_dates: bool, calendar=None,
-                 default_management: dict | None = None, stats_path: str | None = None):
+                 default_management: dict | None = None, stats_path: str | None = None,
+                 notifier=None, intermarket_symbols: dict | None = None, oanda_practice: bool = True,
+                 cache_dir: str = "cache"):
+        self.notifier = notifier
+        self.intermarket_symbols = intermarket_symbols or {}
+        self.oanda_practice = oanda_practice
+        self.cache_dir = cache_dir
         self.calendar = calendar
         self.default_management = default_management
         self.stats_path = stats_path
@@ -350,6 +358,9 @@ class ToolExecutor:
 
     def t_log_cycle(self, kind, summary):
         self.journal.log_event(self.run_id, self.broker.now(), kind, summary)
+        if kind in ("daily_prep", "review", "weekly_review"):
+            title = {"daily_prep": "🗓️ خطة اليوم", "review": "📊 مراجعة اليوم", "weekly_review": "📅 المراجعة الأسبوعية"}[kind]
+            self._notify(f"{title}\n{summary[:3500]}")
         return "Logged."
 
     def t_get_recent_cycles(self, limit=6):
@@ -406,8 +417,10 @@ class ToolExecutor:
         stats = load_stats(self.stats_path) if self.stats_path else None
         found = scan_now(self.broker, syms)
         for s in found:
-            s["bar_time"] = self._t(s["bar_time"])
             s["edge"] = edge_card(stats, s["setup"], s["symbol"], s["session"], s["regime"])
+            validated = any(isinstance(v, dict) and v.get("validated") for v in s["edge"].values())
+            self.journal.record_signal(self.run_id, {**s, "dir": 1 if s["direction"] == "buy" else -1}, validated)
+            s["bar_time"] = self._t(s["bar_time"])
         return found or "No playbook setup fired on the last completed H1 bar."
 
     def t_get_edge_stats(self, setup=None, symbol=None):
@@ -420,7 +433,12 @@ class ToolExecutor:
                 "rules": stats["rules"], "rows": rows[:60]}
 
     # ---- trading tools --------------------------------------------------------------------
-    def t_open_trade(self, symbol, direction, stop_loss, risk_percent, setup, reasoning, take_profit=None):
+    def _notify(self, text: str) -> None:
+        if self.notifier is not None:
+            self.notifier.send(text)
+
+    def t_open_trade(self, symbol, direction, stop_loss, risk_percent, setup, reasoning, take_profit=None,
+                     win_probability=None):
         symbol = self._symbol(symbol)
         try:
             d = Direction(str(direction).lower())
@@ -440,9 +458,13 @@ class ToolExecutor:
         if not res.ok:
             raise ToolError(f"Broker rejected the order: {res.message}")
         self.risk.register_open()
+        wp = None if win_probability is None else max(0.05, min(0.95, float(win_probability)))
         self.journal.record_open(self.run_id, res.ticket, symbol, d.value, res.volume or plan.volume,
                                  res.price or plan.entry_estimate, float(stop_loss), take_profit,
-                                 plan.risk_amount, now, setup, reasoning)
+                                 plan.risk_amount, now, setup, reasoning, wp)
+        self.journal.mark_signal_taken(self.run_id, symbol, setup, d.sign, res.ticket)
+        self._notify(f"📈 صفقة جديدة #{res.ticket}: {d.value} {symbol} @ {res.price} | وقف {stop_loss} | "
+                     f"هدف {take_profit} | مخاطرة {plan.risk_amount:.2f} | {setup}\n{str(reasoning)[:600]}")
         pos = self.broker.position(res.ticket)
         if pos is not None:
             mplan = mg.default_plan(pos, self.default_management)
@@ -452,6 +474,89 @@ class ToolExecutor:
                 "money_at_risk": round(plan.risk_amount, 2),
                 "stop_pips": round(plan.stop_distance / spec.pip, 1),
                 "reward_risk": None if plan.reward_risk is None else round(plan.reward_risk, 2)}
+
+    def t_place_pending_order(self, symbol, direction, entry_type, entry_price, stop_loss, risk_percent,
+                              setup, reasoning, take_profit=None, expiry_hours=24, win_probability=None):
+        symbol = self._symbol(symbol)
+        try:
+            d = Direction(str(direction).lower())
+        except ValueError:
+            raise ToolError("direction must be 'buy' or 'sell'")
+        if entry_type not in ("limit", "stop"):
+            raise ToolError("entry_type must be 'limit' or 'stop'")
+        tp = None if take_profit is None else float(take_profit)
+        plan = self.risk.plan_order(symbol, d, float(stop_loss), tp, float(risk_percent),
+                                    order_type=entry_type, entry_price=float(entry_price))
+        now = self.broker.now()
+        if not plan.ok:
+            self.journal.log_event(self.run_id, now, "rejected", "; ".join(plan.reasons),
+                                   {"symbol": symbol, "pending": entry_type, "price": entry_price})
+            raise ToolError("REJECTED by risk manager: " + "; ".join(plan.reasons))
+        expires = now + timedelta(hours=float(expiry_hours)) if expiry_hours else None
+        res = self.broker.place_pending(symbol, d, entry_type, float(entry_price), plan.volume, float(stop_loss),
+                                        tp, expires, comment=str(setup)[:31])
+        if not res.ok:
+            raise ToolError(f"Broker rejected the order: {res.message}")
+        wp = None if win_probability is None else max(0.05, min(0.95, float(win_probability)))
+        self.journal.record_order(self.run_id, res.ticket, symbol, d.value, entry_type, float(entry_price),
+                                  plan.volume, float(stop_loss), tp, plan.risk_amount, now, expires, setup,
+                                  reasoning, wp)
+        self.risk.register_open()
+        self._notify(f"⏳ أمر معلّق #{res.ticket}: {d.value} {entry_type} {symbol} @ {entry_price} | "
+                     f"وقف {stop_loss} | هدف {tp} | {setup}")
+        return {"status": "pending", "ticket": res.ticket, "volume": plan.volume,
+                "money_at_risk_if_filled": round(plan.risk_amount, 2),
+                "reward_risk": None if plan.reward_risk is None else round(plan.reward_risk, 2),
+                "expires": self._t(expires) if expires else "GTC"}
+
+    def t_list_pending_orders(self):
+        return [o.to_dict() for o in self.broker.pending_orders()] or "No pending orders."
+
+    def t_cancel_pending_order(self, ticket, reasoning):
+        res = self.broker.cancel_pending(int(ticket))
+        if not res.ok:
+            raise ToolError(f"Could not cancel: {res.message}")
+        self.journal.set_order_status(self.run_id, int(ticket), "cancelled")
+        self.journal.log_event(self.run_id, self.broker.now(), "cancel", reasoning, {"ticket": int(ticket)})
+        return "Cancelled."
+
+    # ---- analysis ---------------------------------------------------------------------------
+    def t_get_market_structure(self, symbol, timeframe="H4"):
+        from ..structure import market_structure
+        if timeframe not in TF_ENUM:
+            raise ToolError(f"timeframe must be one of {TF_ENUM}")
+        ms = market_structure(self.broker, self._symbol(symbol), timeframe, utc_offset=self.broker.utc_offset())
+        ms.pop("all_zones_by_strength", None)
+        return ms
+
+    def chart_png(self, symbol, timeframe="H1", count=120, show_levels=True, bollinger=False) -> bytes:
+        from ..charts import render_chart
+        from ..structure import key_levels, market_structure
+        symbol = self._symbol(symbol)
+        levels = key_levels(market_structure(self.broker, symbol, "H4")) if show_levels else None
+        return render_chart(self.broker, symbol, timeframe, int(count), levels=levels,
+                            positions=[p for p in self.broker.positions() if p.symbol == symbol],
+                            orders=[o for o in self.broker.pending_orders() if o.symbol == symbol],
+                            alerts=[a for a in self.journal.alerts(self.run_id, "active") if a["symbol"] == symbol],
+                            bollinger=bollinger)
+
+    def t_get_intermarket(self):
+        from ..intermarket import broker_intermarket, macro_snapshot
+        return {"broker_instruments": broker_intermarket(self.broker, self.intermarket_symbols)
+                or "none configured (config: intermarket_symbols)",
+                "macro_fred": macro_snapshot(self.cache_dir)}
+
+    def t_get_positioning(self, symbol):
+        from ..intermarket import positioning
+        return positioning(self._symbol(symbol), self.cache_dir, self.oanda_practice)
+
+    def t_get_performance_diagnostics(self):
+        from ..diagnostics import calibration_report, discretion_report, excursion_report
+        trades = self.journal.trades(self.run_id, closed_only=True)
+        return {"calibration": calibration_report(trades),
+                "discretion_vs_shadow_book": discretion_report(self.journal.signals(self.run_id), trades),
+                "excursions": excursion_report(trades),
+                "risk_state": self.risk.period_state()}
 
     def t_modify_trade(self, ticket, reasoning, stop_loss=None, take_profit=None):
         p = self.broker.position(int(ticket))

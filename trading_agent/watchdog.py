@@ -23,7 +23,12 @@ log = logging.getLogger(__name__)
 
 
 class Watchdog:
-    def __init__(self, broker, journal, run_id: int, risk, cfg, wake: Callable[[str], bool] | None = None):
+    def __init__(self, broker, journal, run_id: int, risk, cfg, wake: Callable[[str], bool] | None = None,
+                 notifier=None, max_hold_hours: int = 72):
+        from .diagnostics import Sync
+        self.notifier = notifier
+        self.sync = Sync(broker, journal, run_id, notifier, cfg.default_management, max_hold_hours)
+        self._last_shadow_eval = None
         self.broker = broker
         self.journal = journal
         self.run_id = run_id
@@ -36,11 +41,12 @@ class Watchdog:
     def tick(self) -> dict:
         now = self.broker.now()
         out = {"closed": [], "actions": [], "alerts": []}
-        for ticket in self.journal.open_tickets(self.run_id):
-            ct = self.broker.closed_trade(ticket)
-            if ct is not None:
-                self.journal.record_close(self.run_id, ct)
-                out["closed"].append(ct.ticket)
+        synced = self.sync.run()
+        out["closed"] = synced["closed"]
+        # evaluate the shadow book every 30 minutes (broker time)
+        if self._last_shadow_eval is None or now - self._last_shadow_eval >= timedelta(minutes=30):
+            self.sync.evaluate_signals()
+            self._last_shadow_eval = now
 
         for p in self.broker.positions():
             key = mg.plan_key(p.ticket)
@@ -54,6 +60,8 @@ class Watchdog:
                 self.journal.set_kv(self.run_id, key, plan.to_dict())
             for a in acts:
                 self.journal.log_event(self.run_id, now, "mgmt", a)
+                if self.notifier is not None:
+                    self.notifier.send(f"🛠️ {a}")
                 if "stop ->" in a:
                     self.journal.update_levels(self.run_id, p.ticket, sl=p.stop_loss)
             out["actions"] += acts
@@ -88,6 +96,8 @@ class Watchdog:
                 self.journal.set_alert_status(a["id"], "triggered", now, bid)
                 a.update(status="triggered", trigger_price=bid)
                 self.journal.log_event(self.run_id, now, "alert", f"{a['symbol']} {a['condition']} {a['price']}: {a['note']}")
+                if self.notifier is not None:
+                    self.notifier.send(f"🔔 تنبيه {a['symbol']} {a['condition']} {a['price']} (الآن {bid}): {a['note']}")
                 fired.append(a)
         return fired
 

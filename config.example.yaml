@@ -20,6 +20,9 @@ risk:
   news_blackout_minutes_before: 30
   news_blackout_minutes_after: 15
   news_blackout_min_impact: High
+  max_weekly_loss_pct: 5.0
+  max_monthly_loss_pct: 8.0
+  drawdown_risk_tiers: [[5.0, 0.5], [10.0, 0.25]]   # [drawdown % from peak, risk multiplier]
 
 agent:
   model: claude-opus-5-5
@@ -46,6 +49,13 @@ watchdog:
   close_all_on_daily_loss: false
   default_management: {break_even_at_r: 1.0, partial_at_r: null, trail_atr_mult: null, time_stop_hours: null}
   # wake_command: [powershell, -NoProfile, -ExecutionPolicy, Bypass, -File, scripts\run_routine.ps1, -Routine, trade-cycle, -Context, "{context}"]
+
+context:
+  # Related instruments on YOUR broker (check the exact names in MT5 Market Watch), label: symbol
+  intermarket_symbols: {}           # e.g. {US500: US500, DXY: USDX, OIL: WTICO, US10Y: USTBOND}
+  oanda_practice: true              # OANDA retail positioning (env OANDA_API_TOKEN)
+  cache_dir: cache
+  notifications: true               # Telegram (env TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 research:
   stats_path: cache/edge_stats.json

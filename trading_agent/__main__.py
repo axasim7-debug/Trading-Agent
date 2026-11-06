@@ -99,17 +99,24 @@ def cmd_watchdog(args):  # pragma: no cover - needs MT5
     risk = RiskManager(cfg.risk, broker, cfg.commission_per_lot, journal=journal, run_id=run_id,
                        calendar=EconomicCalendar())
     wake = command_waker(cfg.watchdog.wake_command) if cfg.watchdog.wake_command and not args.no_wake else None
+    from .notifier import Notifier
+    notifier = Notifier(enabled=cfg.context.notifications)
     try:
-        Watchdog(broker, journal, run_id, risk, cfg.watchdog, wake).run()
+        Watchdog(broker, journal, run_id, risk, cfg.watchdog, wake, notifier=notifier,
+                 max_hold_hours=cfg.research.max_hold_hours).run()
     finally:
         broker.shutdown()
 
 
 def cmd_research(args):
-    from .data import load_symbols
+    from .data import load_symbols, mt5_available, update_history
     from .research import format_table, run_research
 
     cfg = load_config(args.config)
+    if not args.no_update and mt5_available():
+        print("updating history from MT5 ...")
+        for p in update_history(cfg, cfg.backtest.base_timeframe, args.bars):
+            print("  ", p)
     data = load_symbols(cfg.backtest.data_dir, cfg.watchlist, cfg.backtest.base_timeframe)
     rep = run_research(cfg, data)
     print(f"data {rep['data_from']} -> {rep['data_to']}, out-of-sample from {rep['oos_from']}")
@@ -173,6 +180,8 @@ def main(argv=None):
     p.set_defaults(func=cmd_watchdog)
 
     p = sub.add_parser("research", help="Measure the historical edge of the playbook setups")
+    p.add_argument("--no-update", action="store_true", help="do not refresh history from MT5 first")
+    p.add_argument("--bars", type=int, default=200_000, help="bars to request from MT5 per symbol")
     p.set_defaults(func=cmd_research)
 
     p = sub.add_parser("sample-data", help="Write synthetic random-walk data to try the pipeline")

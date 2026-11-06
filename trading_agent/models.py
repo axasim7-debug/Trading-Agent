@@ -75,6 +75,27 @@ class Position:
 
 
 @dataclass
+class PendingOrder:
+    ticket: int
+    symbol: str
+    direction: Direction
+    order_type: str            # "limit" or "stop"
+    price: float
+    volume: float
+    stop_loss: float
+    take_profit: float | None
+    created: datetime
+    expires: datetime | None = None
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["direction"] = self.direction.value
+        d["created"] = self.created.isoformat(timespec="minutes")
+        d["expires"] = self.expires.isoformat(timespec="minutes") if self.expires else None
+        return d
+
+
+@dataclass
 class ClosedTrade:
     ticket: int
     symbol: str

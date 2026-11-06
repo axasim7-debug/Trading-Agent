@@ -184,6 +184,9 @@ def main(argv=None):
     p.add_argument("--bars", type=int, default=200_000, help="bars to request from MT5 per symbol")
     p.set_defaults(func=cmd_research)
 
+    from .lab.cli import add_parser as add_lab_parser
+    add_lab_parser(sub)
+
     p = sub.add_parser("sample-data", help="Write synthetic random-walk data to try the pipeline")
     p.add_argument("--days", type=int, default=120)
     p.set_defaults(func=cmd_sample_data)

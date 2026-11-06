@@ -64,6 +64,12 @@ research:
   min_trades: 30
   min_oos_trades: 15
 
+lab:
+  holdout_fraction: 0.15            # most recent 15% of history stays untouched until `lab finalize`
+  walk_forward_folds: 5
+  min_oos_trades: 100
+  min_holdout_trades: 30
+
 mt5:
   login: null                   # or env MT5_LOGIN
   server: null                  # or env MT5_SERVER  (password: env MT5_PASSWORD)

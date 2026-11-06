@@ -417,11 +417,23 @@ class ToolExecutor:
         stats = load_stats(self.stats_path) if self.stats_path else None
         found = scan_now(self.broker, syms)
         for s in found:
+            s["source"] = "playbook"
             s["edge"] = edge_card(stats, s["setup"], s["symbol"], s["session"], s["regime"])
             validated = any(isinstance(v, dict) and v.get("validated") for v in s["edge"].values())
             self.journal.record_signal(self.run_id, {**s, "dir": 1 if s["direction"] == "buy" else -1}, validated)
             s["bar_time"] = self._t(s["bar_time"])
-        return found or "No playbook setup fired on the last completed H1 bar."
+        try:
+            from ..lab.live import approved_signals
+            lab = approved_signals(self.broker, syms)
+        except Exception as e:  # never let a strategy file break the live desk
+            lab = [{"error": f"lab strategies unavailable: {e}"}]
+        for s in lab:
+            if "error" in s:
+                continue
+            self.journal.record_signal(self.run_id, {**s, "dir": 1 if s["direction"] == "buy" else -1}, True)
+            s["bar_time"] = self._t(s["bar_time"])
+        found += lab
+        return found or "No playbook or lab-approved setup fired on the last completed H1 bar."
 
     def t_get_edge_stats(self, setup=None, symbol=None):
         stats = load_stats(self.stats_path) if self.stats_path else None

@@ -13,3 +13,4 @@ STOP
 cache/
 logs/*.log
 logs/routine.lock
+lab/reports/

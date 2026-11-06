@@ -102,6 +102,14 @@ class ResearchConfig:
 
 
 @dataclass
+class LabConfig:
+    holdout_fraction: float = 0.15     # most recent 15% of history: untouched until `lab finalize`
+    walk_forward_folds: int = 5
+    min_oos_trades: int = 100
+    min_holdout_trades: int = 30
+
+
+@dataclass
 class ContextConfig:
     # Related instruments on YOUR broker, label -> broker symbol (names differ per broker; check MT5 Market Watch)
     intermarket_symbols: dict = field(default_factory=dict)   # e.g. {"US500": "US500", "DXY": "USDX", "OIL": "WTICO"}
@@ -123,6 +131,7 @@ class Config:
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    lab: LabConfig = field(default_factory=LabConfig)
     symbols: dict[str, SymbolSpec] = field(default_factory=dict)
 
     def spec(self, symbol: str) -> SymbolSpec:
@@ -158,6 +167,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         watchdog=_fill(WatchdogConfig, raw.get("watchdog")),
         research=_fill(ResearchConfig, raw.get("research")),
         context=_fill(ContextConfig, raw.get("context")),
+        lab=_fill(LabConfig, raw.get("lab")),
     )
     for name, spec in (raw.get("symbols") or {}).items():
         merged = {**DEFAULT_SYMBOLS.get(name, {}), **(spec or {})}

@@ -46,6 +46,11 @@ The playbook setups below are also coded as deterministic scanners and measured 
 - Your discretion is a filter on top of measured edge, not a substitute for it. The journal tracks
   whether your filtering actually improves the results.
 
+Strategies approved by the research lab (`research-lab` skill: walk-forward + multiple-testing
+gates + one-time holdout) also appear in `scan_setups` with `source: lab-approved`. They are
+validated by construction; treat them like validated playbook setups, using their exact name as
+the setup tag.
+
 ## Your playbook (setups you are allowed to trade)
 Tag every trade with one of these exact setup names so statistics stay comparable:
 1. `trend-pullback`: D1/H4 trend clear (EMA structure + higher highs/lows); price pulls back to a
@@ -118,9 +123,12 @@ An always-on watchdog (no AI) manages positions and watches prices while you are
 - `trade-cycle`: every hour. Manage positions, scan, execute only playbook setups.
 - `daily-review`: after New York close. Grade every decision, update stats, save at most 2 notes.
 - `weekly-review`: weekend. Per-setup statistics, what to stop/keep doing, and a weekly plan.
+- `research-lab`: on demand (interactive). Explore history, code and evaluate new strategies.
 
 ## Working on the code (when the owner asks for development, not trading)
 - Python 3.11+. Tests: `python -m pytest -q`. Keep the risk manager authoritative: never move a hard
   limit into the prompt only.
 - Backtests: `python -m trading_agent backtest --agent random` (simulator, no look-ahead).
 - The MCP server is `python -m trading_agent.mcp_server` (configured in `.mcp.json`).
+- Research lab: `python -m trading_agent lab explore|evaluate <name>|finalize <name>|list`.
+  Strategies live in `strategies/*.py` (see `_template.py`); the registry is `lab/registry.json`.

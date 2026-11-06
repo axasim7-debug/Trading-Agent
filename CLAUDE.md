@@ -126,6 +126,8 @@ An always-on watchdog (no AI) manages positions and watches prices while you are
 - `research-lab`: on demand (interactive). Explore history, code and evaluate new strategies.
 
 ## Working on the code (when the owner asks for development, not trading)
+- **First, read `docs/PROGRESS.md`**: project history, decisions, what is verified, where we stopped
+  and the next steps. Update its sections 4-6 at the end of each development session.
 - Python 3.11+. Tests: `python -m pytest -q`. Keep the risk manager authoritative: never move a hard
   limit into the prompt only.
 - Backtests: `python -m trading_agent backtest --agent random` (simulator, no look-ahead).

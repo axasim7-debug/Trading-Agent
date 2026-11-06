@@ -74,6 +74,12 @@ class MT5Broker(Broker):  # pragma: no cover - needs a live terminal
             return datetime.now(timezone.utc).replace(tzinfo=None)
         return datetime.fromtimestamp(tick.time, tz=timezone.utc).replace(tzinfo=None)
 
+    def utc_offset(self):
+        """MT5 server clocks usually run at UTC+2/UTC+3. Rounded to the nearest 30 minutes."""
+        from datetime import timedelta
+        delta = self.now() - datetime.now(timezone.utc).replace(tzinfo=None)
+        return timedelta(minutes=30 * round(delta.total_seconds() / 1800))
+
     def account(self) -> Account:
         a = self.mt5.account_info()
         return Account(balance=a.balance, equity=a.equity, margin_free=a.margin_free,

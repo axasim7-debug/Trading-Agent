@@ -22,10 +22,16 @@ class OrderPlan:
 
 
 class RiskManager:
-    def __init__(self, cfg: RiskConfig, broker: Broker, commission_per_lot: float = 0.0):
+    def __init__(self, cfg: RiskConfig, broker: Broker, commission_per_lot: float = 0.0,
+                 journal=None, run_id: int | None = None, calendar=None):
+        """`journal`/`run_id` make daily state survive restarts (each Claude Code session starts a
+        fresh process). `calendar` (EconomicCalendar) enables the news blackout."""
         self.cfg = cfg
         self.broker = broker
         self.commission_per_lot = commission_per_lot
+        self.journal = journal
+        self.run_id = run_id
+        self.calendar = calendar
         self.day: date | None = None
         self.day_start_equity = 0.0
         self.trades_today = 0
@@ -35,12 +41,28 @@ class RiskManager:
     def roll_day(self) -> bool:
         """Reset daily counters when the broker date changes. Returns True on a new day."""
         today = self.broker.now().date()
+        if self.journal is not None:
+            key = f"day_start_equity:{today}"
+            eq = self.journal.get_kv(self.run_id, key)
+            if eq is None:
+                eq = self.broker.account().equity
+                self.journal.set_kv(self.run_id, key, eq)
+            self.day_start_equity = eq
+            self.trades_today = self.journal.trades_opened_on(self.run_id, str(today))
+            new = today != self.day
+            self.day = today
+            return new
         if today != self.day:
             self.day = today
             self.day_start_equity = self.broker.account().equity
             self.trades_today = 0
             return True
         return False
+
+    def register_open(self) -> None:
+        if self.journal is None:
+            self.trades_today += 1
+        # with a journal the count is read back from the trades table
 
     def daily_pnl(self) -> float:
         return self.broker.account().equity - self.day_start_equity
@@ -60,6 +82,9 @@ class RiskManager:
             "max_total_open_risk_pct": self.cfg.max_total_open_risk_pct,
             "max_risk_per_trade_pct": self.cfg.max_risk_per_trade_pct,
             "new_trades_blocked": self.block_reason(),
+            "currency_exposure_pct": {k: round(100 * v / base, 2)
+                                      for k, v in self.currency_exposure().items() if abs(v) > 0},
+            "max_currency_exposure_pct": self.cfg.max_currency_exposure_pct,
         }
 
     def block_reason(self) -> str | None:
@@ -90,6 +115,34 @@ class RiskManager:
 
     def open_risk(self) -> float:
         return sum(self.position_risk(p) for p in self.broker.positions())
+
+    def currency_exposure(self, extra: tuple[str, Direction, float] | None = None) -> dict[str, float]:
+        """Net money-at-risk per currency. Long EURUSD = long EUR / short USD."""
+        exp: dict[str, float] = {}
+        items = [(p.symbol, p.direction, self.position_risk(p)) for p in self.broker.positions()]
+        if extra:
+            items.append(extra)
+        for sym, d, risk in items:
+            if risk == float("inf"):
+                continue
+            spec = self.broker.symbol_spec(sym)
+            exp[spec.base] = exp.get(spec.base, 0.0) + d.sign * risk
+            exp[spec.quote] = exp.get(spec.quote, 0.0) - d.sign * risk
+        return exp
+
+    def news_block(self, symbol: str) -> str | None:
+        if self.calendar is None:
+            return None
+        now_utc = self.broker.now() - self.broker.utc_offset()
+        try:
+            ev = self.calendar.blackout(symbol, now_utc, self.cfg.news_blackout_minutes_before,
+                                        self.cfg.news_blackout_minutes_after, self.cfg.news_blackout_min_impact)
+        except Exception as e:  # calendar unavailable: fail safe, say so
+            return f"economic calendar unavailable ({e}); cannot verify news blackout"
+        if ev:
+            return (f"news blackout: {ev.currency} {ev.impact}-impact '{ev.title}' at "
+                    f"{(ev.time_utc + self.broker.utc_offset()):%H:%M} server time")
+        return None
 
     # ---- checks ---------------------------------------------------------------------------
     def plan_order(self, symbol: str, direction: Direction, stop_loss: float,
@@ -158,6 +211,13 @@ class RiskManager:
             if self.open_risk() + actual_risk > max_open + 1e-9:
                 reasons.append(
                     f"total open risk would exceed {c.max_total_open_risk_pct}% of equity")
+            cap = equity * c.max_currency_exposure_pct / 100
+            for ccy, v in self.currency_exposure((symbol, direction, actual_risk)).items():
+                if abs(v) > cap + 1e-9:
+                    reasons.append(f"net {ccy} exposure would be {100 * v / equity:+.2f}% of equity "
+                                   f"(max {c.max_currency_exposure_pct}%) - correlated with open trades")
+        if (nb := self.news_block(symbol)):
+            reasons.append(nb)
 
         return OrderPlan(not reasons, volume, actual_risk, entry, stop_distance, rr, reasons)
 
@@ -177,5 +237,3 @@ class RiskManager:
                 reasons.append(f"take_profit {new_tp} is on the wrong side of the market")
         return reasons
 
-    def register_open(self) -> None:
-        self.trades_today += 1

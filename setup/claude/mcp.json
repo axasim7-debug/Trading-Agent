@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "trading": {
+      "command": "python",
+      "args": ["-m", "trading_agent.mcp_server", "--config", "config.yaml"],
+      "env": {}
+    }
+  }
+}

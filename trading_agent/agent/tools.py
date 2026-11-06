@@ -122,7 +122,72 @@ TOOL_SCHEMAS: list[dict] = [
     },
 ]
 
+# Extra tools for the live desk (Claude Code / MCP). Not offered in backtests:
+# there is no historical calendar, and plans/summaries are part of the live routine.
+LIVE_TOOL_SCHEMAS: list[dict] = [
+    {
+        "name": "get_economic_calendar",
+        "description": "Scheduled macro releases (central bank decisions, NFP, CPI, PMIs...) with impact, "
+                       "forecast and previous values. Times in broker server time and UTC.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "currencies": {"type": "array", "items": {"type": "string"},
+                               "description": "e.g. ['USD','EUR']; omit for all currencies in the watchlist."},
+                "hours_ahead": {"type": "number", "minimum": 1, "maximum": 168},
+                "min_impact": {"type": "string", "enum": ["Low", "Medium", "High"]},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_session_info",
+        "description": "Broker server time, UTC time, which FX sessions are open, and today's date.",
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "save_plan",
+        "description": "Save the daily or weekly trading plan (bias per market, key levels, scenarios, events "
+                       "to avoid). Intraday cycles read it back with get_plan.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"scope": {"type": "string", "enum": ["daily", "weekly"]},
+                           "plan": {"type": "string", "maxLength": 8000}},
+            "required": ["scope", "plan"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_plan",
+        "description": "Read the current daily and weekly trading plans.",
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "log_cycle",
+        "description": "Record the outcome of this routine in the journal (call once at the end of every "
+                       "routine). Recent summaries are shown to later cycles for continuity.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"kind": {"type": "string", "enum": ["cycle", "daily_prep", "review", "weekly_review"]},
+                           "summary": {"type": "string", "maxLength": 4000}},
+            "required": ["kind", "summary"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_recent_cycles",
+        "description": "Summaries written at the end of recent routines (what was seen, done, and watched).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 30}},
+            "additionalProperties": False,
+        },
+    },
+]
+
 TRADING_TOOLS = {"open_trade", "modify_trade", "close_trade"}
+
+SESSIONS_UTC = {"Sydney": (21, 6), "Tokyo": (0, 9), "London": (7, 16), "New York": (12, 21)}
 
 
 class ToolError(Exception):
@@ -131,7 +196,8 @@ class ToolError(Exception):
 
 class ToolExecutor:
     def __init__(self, broker: Broker, risk: RiskManager, journal: Journal, run_id: int,
-                 watchlist: list[str], hide_dates: bool):
+                 watchlist: list[str], hide_dates: bool, calendar=None):
+        self.calendar = calendar
         self.broker = broker
         self.risk = risk
         self.journal = journal
@@ -225,6 +291,62 @@ class ToolExecutor:
     def t_save_note(self, note):
         self.journal.add_note(self.run_id, self.broker.now(), str(note)[:600])
         return "Saved."
+
+    # ---- live desk tools -------------------------------------------------------------------
+    def _now_utc(self):
+        return self.broker.now() - self.broker.utc_offset()
+
+    def t_get_economic_calendar(self, currencies=None, hours_ahead=24, min_impact="Medium"):
+        if self.calendar is None:
+            raise ToolError("Economic calendar is not available in this mode.")
+        if currencies:
+            ccys = {str(c).upper() for c in currencies}
+        else:
+            ccys = {c for s in self.watchlist for c in (s[:3], s[3:6])}
+        try:
+            evs = self.calendar.upcoming(self._now_utc(), ccys, float(hours_ahead), min_impact)
+        except Exception as e:
+            raise ToolError(f"Calendar feed unavailable: {e}. Use web search for the schedule.")
+        off = self.broker.utc_offset()
+        return {"now_server": self.broker.now().strftime("%a %Y-%m-%d %H:%M"),
+                "events": [e.to_dict(off) for e in evs] or "No matching events."}
+
+    def t_get_session_info(self):
+        now_utc = self._now_utc()
+        h = now_utc.hour + now_utc.minute / 60
+        def is_open(a, b):
+            return a <= h < b if a < b else (h >= a or h < b)
+        open_ = [n for n, (a, b) in SESSIONS_UTC.items() if is_open(a, b)]
+        weekend = now_utc.weekday() == 5 or (now_utc.weekday() == 6 and h < 21) or \
+            (now_utc.weekday() == 4 and h >= 21)
+        return {"server_time": self.broker.now().strftime("%a %Y-%m-%d %H:%M"),
+                "utc_time": now_utc.strftime("%a %Y-%m-%d %H:%M"),
+                "server_utc_offset_hours": self.broker.utc_offset().total_seconds() / 3600,
+                "open_sessions": open_ or ["none (rollover/low liquidity)"],
+                "fx_market_closed_for_weekend": weekend,
+                "session_hours_utc": SESSIONS_UTC}
+
+    def t_save_plan(self, scope, plan):
+        if scope not in ("daily", "weekly"):
+            raise ToolError("scope must be daily or weekly")
+        now = self.broker.now()
+        key = f"plan:daily:{now.date()}" if scope == "daily" else f"plan:weekly:{now.isocalendar()[1]}"
+        self.journal.set_kv(self.run_id, key, {"saved": now.isoformat(timespec="minutes"), "plan": plan})
+        return f"{scope} plan saved."
+
+    def t_get_plan(self):
+        now = self.broker.now()
+        return {"daily": self.journal.get_kv(self.run_id, f"plan:daily:{now.date()}") or "No daily plan yet today.",
+                "weekly": self.journal.get_kv(self.run_id, f"plan:weekly:{now.isocalendar()[1]}")
+                or "No weekly plan yet this week."}
+
+    def t_log_cycle(self, kind, summary):
+        self.journal.log_event(self.run_id, self.broker.now(), kind, summary)
+        return "Logged."
+
+    def t_get_recent_cycles(self, limit=6):
+        return self.journal.events(self.run_id, ("cycle", "daily_prep", "review", "weekly_review"),
+                                   int(limit)) or "No previous routines logged."
 
     # ---- trading tools --------------------------------------------------------------------
     def t_open_trade(self, symbol, direction, stop_loss, risk_percent, setup, reasoning, take_profit=None):

@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS notes (
     run_id INTEGER, time TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS equity (
     run_id INTEGER, time TEXT, balance REAL, equity REAL);
+CREATE TABLE IF NOT EXISTS kv (
+    run_id INTEGER, key TEXT, value TEXT, updated TEXT, PRIMARY KEY (run_id, key));
 """
 
 
@@ -31,7 +33,7 @@ def _ts(t: datetime) -> str:
 
 class Journal:
     def __init__(self, path: str = "journal.sqlite"):
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, check_same_thread=False)  # callers serialise access
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
 
@@ -43,6 +45,28 @@ class Journal:
              json.dumps(config or {}, default=str)))
         self.db.commit()
         return cur.lastrowid
+
+    def get_or_create_run(self, mode: str, agent: str, label: str, config: dict | None = None) -> int:
+        """Persistent run (e.g. the live demo account) shared by every Claude Code session."""
+        row = self.db.execute("SELECT id FROM runs WHERE mode=? AND label=? ORDER BY id DESC LIMIT 1",
+                              (mode, label)).fetchone()
+        return row["id"] if row else self.start_run(mode, agent, label, config)
+
+    # ---- key/value state (daily start equity, trading plans, ...) --------------------------
+    def get_kv(self, run_id, key, default=None):
+        row = self.db.execute("SELECT value FROM kv WHERE run_id=? AND key=?", (run_id, key)).fetchone()
+        return json.loads(row["value"]) if row else default
+
+    def set_kv(self, run_id, key, value):
+        self.db.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?,?)",
+                        (run_id, key, json.dumps(value, default=str, ensure_ascii=False),
+                         datetime.now().isoformat(timespec="seconds")))
+        self.db.commit()
+
+    def trades_opened_on(self, run_id, day: str) -> int:
+        row = self.db.execute("SELECT COUNT(*) AS n FROM trades WHERE run_id=? AND open_time LIKE ?",
+                              (run_id, f"{day}%")).fetchone()
+        return row["n"]
 
     def runs(self) -> pd.DataFrame:
         return pd.read_sql("SELECT id, started_at, mode, agent, label FROM runs ORDER BY id", self.db)
@@ -99,6 +123,12 @@ class Journal:
     def notes(self, run_id, limit=15) -> list[dict]:
         rows = self.db.execute("SELECT time, text FROM notes WHERE run_id=? ORDER BY rowid DESC LIMIT ?",
                                (run_id, limit)).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def events(self, run_id, kinds: tuple[str, ...] = ("cycle",), limit=10) -> list[dict]:
+        q = f"SELECT time, kind, text FROM events WHERE run_id=? AND kind IN ({','.join('?' * len(kinds))})" \
+            " ORDER BY rowid DESC LIMIT ?"
+        rows = self.db.execute(q, (run_id, *kinds, limit)).fetchall()
         return [dict(r) for r in reversed(rows)]
 
     def log_event(self, run_id, time, kind, text, data=None):

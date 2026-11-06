@@ -3,5 +3,6 @@ pandas>=2.2
 numpy>=1.26
 pyyaml>=6.0
 pytest>=8.0
+mcp>=2.0               # MCP server for Claude Code / Claude Desktop
 # Windows only, for live trading / downloading history:
 MetaTrader5>=5.0.45; sys_platform == "win32"

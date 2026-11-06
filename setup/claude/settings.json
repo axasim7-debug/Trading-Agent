@@ -1,0 +1,10 @@
+{
+  "enabledMcpjsonServers": ["trading"],
+  "permissions": {
+    "allow": [
+      "mcp__trading",
+      "WebSearch",
+      "WebFetch"
+    ]
+  }
+}

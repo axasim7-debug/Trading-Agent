@@ -8,3 +8,8 @@ data/*.csv
 STOP
 .env
 .pytest_cache/
+.mcp.json
+.claude/settings.local.json
+cache/
+logs/*.log
+logs/routine.lock

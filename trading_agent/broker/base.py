@@ -48,6 +48,11 @@ class Broker(ABC):
     def closed_trade(self, ticket: int) -> ClosedTrade | None:
         """Details of a position that is no longer open, or None if still open/unknown."""
 
+    def utc_offset(self):
+        """Broker clock minus UTC. Simulated data is treated as UTC."""
+        from datetime import timedelta
+        return timedelta(0)
+
     def shutdown(self) -> None:  # pragma: no cover - optional hook
         pass
 

@@ -33,6 +33,10 @@ class RiskConfig:
     require_take_profit: bool = False
     max_spread_to_stop_ratio: float = 0.2  # spread may be at most 20% of the stop distance
     max_trades_per_day: int = 10
+    max_currency_exposure_pct: float = 2.0    # net risk on any single currency (e.g. long EURUSD + long GBPUSD = USD short twice)
+    news_blackout_minutes_before: int = 30    # no new trades on a currency this close to a high-impact release
+    news_blackout_minutes_after: int = 15
+    news_blackout_min_impact: str = "High"
 
 
 @dataclass

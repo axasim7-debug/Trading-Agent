@@ -1,0 +1,294 @@
+"""Tools the agent can call, and their executor. Every order goes through the RiskManager."""
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import pandas as pd
+
+from ..broker.base import Broker
+from ..journal import Journal
+from ..market import candles_text, fmt_time, market_overview
+from ..models import TIMEFRAMES, Direction
+from ..risk import RiskManager
+
+TF_ENUM = ["M15", "H1", "H4", "D1"]
+
+TOOL_SCHEMAS: list[dict] = [
+    {
+        "name": "get_account_status",
+        "description": "Account balance/equity, today's P/L versus the daily target and loss limit, "
+                       "trades taken today, open risk, and whether new trades are currently blocked.",
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "get_market_overview",
+        "description": "One-line snapshot per symbol: price, spread, D1/H4/H1 trend labels, H1 RSI/ADX/ATR, "
+                       "D1 ATR and 24h change. Use it to decide which charts deserve a closer look.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"symbols": {"type": "array", "items": {"type": "string"},
+                                       "description": "Subset of the watchlist; omit for all."}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_candles",
+        "description": "Completed OHLC bars for one symbol and timeframe as CSV, optionally with "
+                       "EMA20/50/200, RSI14, ATR14, ADX14, MACD histogram and Bollinger bands. "
+                       "The bar that is still forming is never included.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "timeframe": {"type": "string", "enum": TF_ENUM},
+                "count": {"type": "integer", "minimum": 10, "maximum": 300},
+                "include_indicators": {"type": "boolean"},
+            },
+            "required": ["symbol", "timeframe", "count"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_open_positions",
+        "description": "Open positions with entry, stop, target, volume, floating P/L and money still at risk.",
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "open_trade",
+        "description": "Open a market order. Position size is computed for you from risk_percent and the "
+                       "stop distance. The risk manager may reject the order; rejections are final for "
+                       "that request - read the reason before trying anything else.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "direction": {"type": "string", "enum": ["buy", "sell"]},
+                "stop_loss": {"type": "number", "description": "Absolute price level."},
+                "take_profit": {"type": "number", "description": "Absolute price level (optional)."},
+                "risk_percent": {"type": "number", "description": "Percent of equity to risk if the stop is hit."},
+                "setup": {"type": "string", "description": "Short tag for the setup type, e.g. 'trend-pullback-H1'."},
+                "reasoning": {"type": "string", "description": "Thesis, confluence, and what would invalidate it."},
+            },
+            "required": ["symbol", "direction", "stop_loss", "risk_percent", "setup", "reasoning"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "modify_trade",
+        "description": "Move the stop (tighten only) and/or the target of an open position.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticket": {"type": "integer"},
+                "stop_loss": {"type": "number"},
+                "take_profit": {"type": "number"},
+                "reasoning": {"type": "string"},
+            },
+            "required": ["ticket", "reasoning"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "close_trade",
+        "description": "Close an open position at market.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"ticket": {"type": "integer"}, "reasoning": {"type": "string"}},
+            "required": ["ticket", "reasoning"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_trade_history",
+        "description": "Your recent closed trades (with your original reasoning and the outcome in R) "
+                       "plus aggregate stats per setup tag.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "save_note",
+        "description": "Save a short lesson or observation to your persistent memory. Recent notes are shown "
+                       "to you at the start of every cycle. Save only durable, evidence-based lessons.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"note": {"type": "string", "maxLength": 600}},
+            "required": ["note"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+TRADING_TOOLS = {"open_trade", "modify_trade", "close_trade"}
+
+
+class ToolError(Exception):
+    pass
+
+
+class ToolExecutor:
+    def __init__(self, broker: Broker, risk: RiskManager, journal: Journal, run_id: int,
+                 watchlist: list[str], hide_dates: bool):
+        self.broker = broker
+        self.risk = risk
+        self.journal = journal
+        self.run_id = run_id
+        self.watchlist = watchlist
+        self.hide_dates = hide_dates
+
+    # ---- dispatch -------------------------------------------------------------------------
+    def execute(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+        """Returns (result_text, is_error)."""
+        fn = getattr(self, f"t_{name}", None)
+        if fn is None:
+            return f"Unknown tool: {name}", True
+        try:
+            result = fn(**(args or {}))
+        except ToolError as e:
+            return str(e), True
+        except TypeError as e:
+            return f"Invalid arguments for {name}: {e}", True
+        except KeyError as e:
+            return f"Unknown symbol or data missing: {e}", True
+        if not isinstance(result, str):
+            result = json.dumps(result, default=str, ensure_ascii=False)
+        return result, False
+
+    def _symbol(self, symbol: str) -> str:
+        s = str(symbol).upper().strip()
+        if s not in self.watchlist:
+            raise ToolError(f"{symbol} is not in the watchlist {self.watchlist}")
+        return s
+
+    def _t(self, t):
+        return fmt_time(t, self.hide_dates)
+
+    # ---- read-only tools ------------------------------------------------------------------
+    def t_get_account_status(self):
+        a = self.broker.account()
+        return {"time": self._t(self.broker.now()), "balance": round(a.balance, 2),
+                "equity": round(a.equity, 2), "currency": a.currency, "is_demo": a.is_demo,
+                "open_positions": len(self.broker.positions()), **self.risk.status()}
+
+    def t_get_market_overview(self, symbols: list[str] | None = None):
+        syms = [self._symbol(s) for s in symbols] if symbols else self.watchlist
+        return market_overview(self.broker, syms, self.hide_dates)
+
+    def t_get_candles(self, symbol, timeframe, count, include_indicators=True):
+        if timeframe not in TF_ENUM:
+            raise ToolError(f"timeframe must be one of {TF_ENUM}")
+        count = max(10, min(int(count), 300))
+        return candles_text(self.broker, self._symbol(symbol), timeframe, count,
+                            bool(include_indicators), self.hide_dates)
+
+    def t_get_open_positions(self):
+        out = []
+        for p in self.broker.positions():
+            spec = self.broker.symbol_spec(p.symbol)
+            bid, ask = self.broker.quote(p.symbol)
+            cur = bid if p.direction is Direction.BUY else ask
+            out.append({
+                "ticket": p.ticket, "symbol": p.symbol, "direction": p.direction.value, "volume": p.volume,
+                "entry": p.entry_price, "stop_loss": p.stop_loss, "take_profit": p.take_profit,
+                "current_exit_price": cur,
+                "pips": round((cur - p.entry_price) * p.direction.sign / spec.pip, 1),
+                "floating_pl": round(p.profit, 2),
+                "money_at_risk": round(self.risk.position_risk(p), 2),
+                "opened": self._t(p.open_time),
+            })
+        return out or "No open positions."
+
+    def t_get_trade_history(self, limit=20):
+        df = self.journal.trades(self.run_id, closed_only=True)
+        if df.empty:
+            return "No closed trades yet."
+        recent = df.tail(int(limit))
+        rows = []
+        for _, r in recent.iterrows():
+            rows.append({
+                "ticket": r.ticket, "symbol": r.symbol, "direction": r.direction, "setup": r.setup,
+                "r_multiple": None if pd.isna(r.r_multiple) else round(r.r_multiple, 2),
+                "profit": round(r.profit, 2), "close_reason": r.close_reason,
+                "reasoning": (r.reasoning or "")[:400],
+            })
+        by_setup = (df.groupby("setup")["r_multiple"]
+                    .agg(trades="count", avg_r="mean", win_rate=lambda s: (s > 0).mean())
+                    .round(3).reset_index().to_dict("records"))
+        return {"recent_trades": rows, "stats_by_setup": by_setup,
+                "all_time": {"trades": len(df), "avg_r": round(df["r_multiple"].mean(), 3),
+                             "win_rate": round((df["r_multiple"] > 0).mean(), 3),
+                             "net_profit": round(df["profit"].sum(), 2)}}
+
+    def t_save_note(self, note):
+        self.journal.add_note(self.run_id, self.broker.now(), str(note)[:600])
+        return "Saved."
+
+    # ---- trading tools --------------------------------------------------------------------
+    def t_open_trade(self, symbol, direction, stop_loss, risk_percent, setup, reasoning, take_profit=None):
+        symbol = self._symbol(symbol)
+        try:
+            d = Direction(str(direction).lower())
+        except ValueError:
+            raise ToolError("direction must be 'buy' or 'sell'")
+        plan = self.risk.plan_order(symbol, d, float(stop_loss),
+                                    None if take_profit is None else float(take_profit), float(risk_percent))
+        now = self.broker.now()
+        if not plan.ok:
+            self.journal.log_event(self.run_id, now, "rejected", "; ".join(plan.reasons),
+                                   {"symbol": symbol, "direction": d.value, "stop_loss": stop_loss,
+                                    "take_profit": take_profit, "risk_percent": risk_percent})
+            raise ToolError("REJECTED by risk manager: " + "; ".join(plan.reasons))
+        res = self.broker.open_position(symbol, d, plan.volume, float(stop_loss),
+                                        None if take_profit is None else float(take_profit),
+                                        comment=str(setup)[:31])
+        if not res.ok:
+            raise ToolError(f"Broker rejected the order: {res.message}")
+        self.risk.register_open()
+        self.journal.record_open(self.run_id, res.ticket, symbol, d.value, res.volume or plan.volume,
+                                 res.price or plan.entry_estimate, float(stop_loss), take_profit,
+                                 plan.risk_amount, now, setup, reasoning)
+        spec = self.broker.symbol_spec(symbol)
+        return {"status": "filled", "ticket": res.ticket, "price": res.price, "volume": res.volume,
+                "money_at_risk": round(plan.risk_amount, 2),
+                "stop_pips": round(plan.stop_distance / spec.pip, 1),
+                "reward_risk": None if plan.reward_risk is None else round(plan.reward_risk, 2)}
+
+    def t_modify_trade(self, ticket, reasoning, stop_loss=None, take_profit=None):
+        p = self.broker.position(int(ticket))
+        if p is None:
+            raise ToolError(f"No open position with ticket {ticket}")
+        sl = None if stop_loss is None else float(stop_loss)
+        tp = None if take_profit is None else float(take_profit)
+        if sl is None and tp is None:
+            raise ToolError("Give stop_loss and/or take_profit")
+        problems = self.risk.check_modify(p, sl, tp)
+        if problems:
+            raise ToolError("REJECTED by risk manager: " + "; ".join(problems))
+        res = self.broker.modify_position(p.ticket, sl, tp)
+        if not res.ok:
+            raise ToolError(f"Broker rejected the change: {res.message}")
+        self.journal.update_levels(self.run_id, p.ticket, sl, tp)
+        self.journal.log_event(self.run_id, self.broker.now(), "modify", reasoning,
+                               {"ticket": p.ticket, "stop_loss": sl, "take_profit": tp})
+        return {"status": "modified", "ticket": p.ticket, "stop_loss": sl or p.stop_loss,
+                "take_profit": tp or p.take_profit}
+
+    def t_close_trade(self, ticket, reasoning):
+        p = self.broker.position(int(ticket))
+        if p is None:
+            raise ToolError(f"No open position with ticket {ticket}")
+        res = self.broker.close_position(p.ticket)
+        if not res.ok:
+            raise ToolError(f"Broker could not close: {res.message}")
+        self.journal.set_close_reasoning(self.run_id, p.ticket, reasoning)
+        return {"status": "closed", "ticket": p.ticket, "price": res.price}
+
+
+def decision_due(now, timeframe: str) -> bool:
+    """True when `now` is exactly on a boundary of `timeframe` (i.e. a bar just closed)."""
+    td = TIMEFRAMES[timeframe]
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (now - midnight) % td == pd.Timedelta(0)

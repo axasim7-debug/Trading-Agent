@@ -1,0 +1,50 @@
+# Copy to config.yaml and edit. Secrets (MT5 password) go in environment variables, not here.
+watchlist: [EURUSD, GBPUSD, USDJPY, XAUUSD]
+decision_timeframe: H1          # the agent is woken at the close of each H1 bar (M15 / H1 / H4 / D1)
+db_path: journal.sqlite
+commission_per_lot: 7.0         # round-turn cost estimate in account currency
+
+risk:
+  max_risk_per_trade_pct: 1.0
+  max_total_open_risk_pct: 3.0
+  max_open_positions: 3
+  max_positions_per_symbol: 1
+  max_daily_loss_pct: 3.0       # no new trades after this daily loss
+  daily_profit_target_pct: 2.0  # shown to the agent as information only
+  stop_trading_at_target: false
+  min_reward_risk: 1.0
+  require_take_profit: false
+  max_spread_to_stop_ratio: 0.2
+  max_trades_per_day: 10
+
+agent:
+  model: claude-opus-5-5
+  effort: high                  # low | medium | high | xhigh | max
+  language: ar                  # language of the agent's reasoning and reports
+  max_tool_rounds: 15
+  web_search: false             # live mode only (never used in backtests)
+  daily_review: true
+  notes_in_prompt: 15
+  use_fallbacks: true
+
+backtest:
+  data_dir: data
+  base_timeframe: M15           # files are read from data/<SYMBOL>_M15.csv
+  start: null                   # e.g. "2024-01-01"
+  end: null
+  initial_balance: 10000
+  hide_dates: true
+  max_cycles: null
+
+mt5:
+  login: null                   # or env MT5_LOGIN
+  server: null                  # or env MT5_SERVER  (password: env MT5_PASSWORD)
+  path: null                    # optional path to terminal64.exe
+  allow_real_account: false     # the bot refuses to run on a real account unless this is true
+  magic: 515151
+  deviation_points: 20
+  symbol_suffix: ""             # e.g. ".m" if your broker names symbols EURUSD.m
+
+# Optional per-symbol overrides for the simulator (MT5 reads these from the broker):
+# symbols:
+#   EURUSD: {point: 0.00001, pip: 0.0001, contract_size: 100000, default_spread_points: 12}

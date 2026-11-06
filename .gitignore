@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+config.yaml
+journal.sqlite
+*.sqlite
+data/*.csv
+STOP
+.env
+.pytest_cache/

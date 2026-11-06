@@ -46,7 +46,9 @@ def build_desk(config_path: str, broker_kind: str) -> ToolExecutor:
     calendar = EconomicCalendar(cache_path=os.path.join("cache", "calendar_thisweek.json"))
     risk = RiskManager(cfg.risk, broker, cfg.commission_per_lot, journal=journal, run_id=run_id,
                        calendar=calendar if broker_kind == "mt5" else None)
-    return ToolExecutor(broker, risk, journal, run_id, cfg.watchlist, hide_dates=False, calendar=calendar)
+    return ToolExecutor(broker, risk, journal, run_id, cfg.watchlist, hide_dates=False, calendar=calendar,
+                        default_management=cfg.watchdog.default_management,
+                        stats_path=cfg.research.stats_path)
 
 
 def create_server(desk: ToolExecutor):
@@ -175,6 +177,53 @@ def create_server(desk: ToolExecutor):
     def get_recent_cycles(limit: Annotated[int, Field(ge=1, le=30)] = 6) -> str:
         """Summaries from recent routines, for continuity between sessions."""
         return call("get_recent_cycles", limit=limit)
+
+    @srv.tool()
+    def scan_setups(symbols: list[str] | None = None) -> str:
+        """Run the coded playbook scanners on the last completed H1 bar. Each signal comes with its
+        historical edge card (win rate, average R, out-of-sample result, validated flag)."""
+        return call("scan_setups", symbols=symbols)
+
+    @srv.tool()
+    def get_edge_stats(setup: str | None = None, symbol: str | None = None) -> str:
+        """Historical statistics of the playbook setups (from `python -m trading_agent research`)."""
+        return call("get_edge_stats", setup=setup, symbol=symbol)
+
+    @srv.tool()
+    def set_alert(symbol: Sym,
+                  condition: Annotated[str, Field(description="above or below")],
+                  price: float,
+                  note: Annotated[str, Field(description="What you will check when it triggers")],
+                  expires_hours: Annotated[float, Field(ge=0.5, le=168)] = 24) -> str:
+        """Price alert watched by the always-on watchdog. When it triggers, you are woken up
+        immediately with this note, instead of waiting for the next hourly cycle."""
+        return call("set_alert", symbol=symbol, condition=condition, price=price, note=note,
+                    expires_hours=expires_hours)
+
+    @srv.tool()
+    def list_alerts() -> str:
+        """Active and triggered (not yet dismissed) alerts."""
+        return call("list_alerts")
+
+    @srv.tool()
+    def dismiss_alert(alert_id: int) -> str:
+        """Dismiss an alert once handled (or cancel an active one)."""
+        return call("dismiss_alert", alert_id=alert_id)
+
+    @srv.tool()
+    def set_trade_management(ticket: int,
+                             break_even_at_r: Annotated[float | None, Field(description="Move stop to entry at this R (null = never)")] = None,
+                             partial_at_r: Annotated[float | None, Field(description="Close part of the position at this R")] = None,
+                             partial_fraction: Annotated[float | None, Field(description="Fraction closed at partial_at_r, e.g. 0.5")] = None,
+                             trail_atr_mult: Annotated[float | None, Field(description="Trail the stop at close - k*ATR")] = None,
+                             trail_timeframe: Annotated[str | None, Field(description="M15, H1, H4 or D1")] = None,
+                             trail_after_r: Annotated[float | None, Field(description="Start trailing after this R")] = None,
+                             time_stop_hours: Annotated[float | None, Field(description="Close after this many hours")] = None) -> str:
+        """Set how the watchdog manages an open position between your cycles (only the given fields change).
+        Stops are only ever tightened."""
+        return call("set_trade_management", ticket=ticket, break_even_at_r=break_even_at_r,
+                    partial_at_r=partial_at_r, partial_fraction=partial_fraction, trail_atr_mult=trail_atr_mult,
+                    trail_timeframe=trail_timeframe, trail_after_r=trail_after_r, time_stop_hours=time_stop_hours)
 
     return srv
 

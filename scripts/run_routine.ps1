@@ -3,7 +3,8 @@
 param(
     [ValidateSet("trade-cycle", "daily-prep", "daily-review", "weekly-review")]
     [string]$Routine = "trade-cycle",
-    [string]$Model = "opus"
+    [string]$Model = "opus",
+    [string]$Context = ""      # set by the watchdog when a price alert wakes the agent
 )
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
@@ -28,6 +29,7 @@ if (Test-Path (Join-Path $root "STOP")) { Remove-Item $lock; exit 0 }
 $stamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
 $log = Join-Path $root "logs\$stamp-$Routine.log"
 $prompt = "Run the $Routine routine now. Follow .claude/skills/$Routine/SKILL.md and CLAUDE.md exactly."
+if ($Context) { $prompt += " You were woken early by the watchdog: $Context. Handle this first." }
 try {
     claude -p $prompt --model $Model `
         --allowedTools "mcp__trading" "WebSearch" "WebFetch" "Read" `

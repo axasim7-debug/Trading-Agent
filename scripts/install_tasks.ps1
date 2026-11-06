@@ -19,4 +19,8 @@ Add-Task "TradeCycle" "trade-cycle" @("/SC", "HOURLY", "/MO", "$CycleEveryHours"
 Add-Task "DailyPrep" "daily-prep" @("/SC", "WEEKLY", "/D", "MON,TUE,WED,THU,FRI", "/ST", $DailyPrep)
 Add-Task "DailyReview" "daily-review" @("/SC", "WEEKLY", "/D", "TUE,WED,THU,FRI,SAT", "/ST", $DailyReview)
 Add-Task "WeeklyReview" "weekly-review" @("/SC", "WEEKLY", "/D", "SAT", "/ST", $WeeklyReview)
+# Watchdog: starts at logon and runs continuously (trade management + price alerts).
+$py = Join-Path $root ".venv\Scripts\pythonw.exe"
+schtasks /Create /F /TN "TradingAgent\Watchdog" /SC ONLOGON /TR "`"$py`" -m trading_agent --config `"$root\config.yaml`" watchdog" | Out-Null
+Write-Host "scheduled Watchdog (at logon; start it now with: schtasks /Run /TN TradingAgent\Watchdog)"
 Write-Host "Done. The PC must be on, MT5 open and logged in to the demo account."

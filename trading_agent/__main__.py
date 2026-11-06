@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import logging
 import sys
 
@@ -78,6 +79,46 @@ def cmd_download(args):  # pragma: no cover - needs MT5
         print("wrote", p)
 
 
+def cmd_watchdog(args):  # pragma: no cover - needs MT5
+    from .broker.mt5 import MT5Broker
+    from .econ_calendar import EconomicCalendar
+    from .risk import RiskManager
+    from .watchdog import Watchdog, command_waker
+
+    cfg_path = os.path.abspath(args.config)
+    os.chdir(os.path.dirname(cfg_path))   # relative paths (journal, scripts) resolve from the project
+    cfg = load_config(cfg_path)
+    os.makedirs("logs", exist_ok=True)
+    fh = logging.FileHandler("logs/watchdog.log", encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(fh)
+    logging.getLogger().setLevel(logging.INFO)
+    broker = MT5Broker(cfg)
+    journal = Journal(cfg.db_path)
+    run_id = journal.get_or_create_run("live", "claude-code", f"mt5-{cfg.mt5.login or 'terminal'}")
+    risk = RiskManager(cfg.risk, broker, cfg.commission_per_lot, journal=journal, run_id=run_id,
+                       calendar=EconomicCalendar())
+    wake = command_waker(cfg.watchdog.wake_command) if cfg.watchdog.wake_command and not args.no_wake else None
+    try:
+        Watchdog(broker, journal, run_id, risk, cfg.watchdog, wake).run()
+    finally:
+        broker.shutdown()
+
+
+def cmd_research(args):
+    from .data import load_symbols
+    from .research import format_table, run_research
+
+    cfg = load_config(args.config)
+    data = load_symbols(cfg.backtest.data_dir, cfg.watchlist, cfg.backtest.base_timeframe)
+    rep = run_research(cfg, data)
+    print(f"data {rep['data_from']} -> {rep['data_to']}, out-of-sample from {rep['oos_from']}")
+    for level in ("setup", "setup+symbol", "setup+session", "setup+regime"):
+        print(f"\n== {level} ==\n" + format_table(rep, level))
+    n_val = sum(r["validated"] for r in rep["table"])
+    print(f"\n{n_val} validated slice(s). Saved to {cfg.research.stats_path}")
+
+
 def cmd_sample_data(args):
     from pathlib import Path
 
@@ -126,6 +167,13 @@ def main(argv=None):
     p.add_argument("--timeframe", default="M15")
     p.add_argument("--bars", type=int, default=100_000)
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("watchdog", help="Always-on trade management + price alerts (MT5)")
+    p.add_argument("--no-wake", action="store_true", help="never start the agent on alerts")
+    p.set_defaults(func=cmd_watchdog)
+
+    p = sub.add_parser("research", help="Measure the historical edge of the playbook setups")
+    p.set_defaults(func=cmd_research)
 
     p = sub.add_parser("sample-data", help="Write synthetic random-walk data to try the pipeline")
     p.add_argument("--days", type=int, default=120)

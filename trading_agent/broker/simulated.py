@@ -60,6 +60,7 @@ class SimBroker(Broker):
         self._tickets = itertools.count(1)
         self._open: dict[int, Position] = {}
         self._closed: dict[int, ClosedTrade] = {}
+        self._partials: dict[int, float] = {}   # realised P/L of partial closes, per ticket
 
     # ---- clock ----------------------------------------------------------------------------
     def now(self) -> datetime:
@@ -182,6 +183,24 @@ class SimBroker(Broker):
         self._close(p, price, reason)
         return OrderResult(True, ticket=ticket, price=price)
 
+    def close_partial(self, ticket, volume):
+        p = self._open.get(ticket)
+        if p is None:
+            return OrderResult(False, message=f"No open position {ticket}")
+        spec = self.specs[p.symbol]
+        volume = round(int(volume / spec.volume_step + 1e-9) * spec.volume_step, 8)
+        if volume <= 0 or volume >= p.volume:
+            return OrderResult(False, message="partial volume must be > 0 and smaller than the position")
+        bid, ask = self.quote(p.symbol)
+        price = bid if p.direction is Direction.BUY else ask
+        gross = self.quote_to_account(
+            p.symbol, (price - p.entry_price) * p.direction.sign * volume * spec.contract_size)
+        net = gross - self.commission_per_lot * volume
+        self.balance += net
+        self._partials[ticket] = self._partials.get(ticket, 0.0) + net
+        p.volume = round(p.volume - volume, 8)
+        return OrderResult(True, ticket=ticket, price=price, volume=volume)
+
     def close_all(self, reason: str = "end_of_test") -> None:
         for t in list(self._open):
             self.close_position(t, reason)
@@ -196,8 +215,9 @@ class SimBroker(Broker):
         net = gross - self.commission_per_lot * p.volume
         self.balance += net
         del self._open[p.ticket]
+        total = net + self._partials.pop(p.ticket, 0.0)
         self._closed[p.ticket] = ClosedTrade(p.ticket, p.symbol, p.direction, p.volume, p.entry_price,
-                                             price, p.open_time, self.now(), net, reason)
+                                             price, p.open_time, self.now(), total, reason)
 
     def _process_bar(self, symbol: str, bar: pd.Series) -> None:
         s = self._spread_price(symbol, bar)

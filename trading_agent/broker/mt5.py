@@ -175,6 +175,24 @@ class MT5Broker(Broker):  # pragma: no cover - needs a live terminal
         }
         return self._send(req)
 
+    def close_partial(self, ticket, volume):
+        p = self.position(ticket)
+        if p is None:
+            return OrderResult(False, message=f"No open position {ticket}")
+        spec = self.symbol_spec(p.symbol)
+        volume = round(int(volume / spec.volume_step + 1e-9) * spec.volume_step, 8)
+        if volume < spec.volume_min or volume >= p.volume:
+            return OrderResult(False, message="partial volume out of range")
+        bs = self._sym(p.symbol)
+        bid, ask = self.quote(p.symbol)
+        is_buy = p.direction is Direction.BUY
+        return self._send({
+            "action": self.mt5.TRADE_ACTION_DEAL, "symbol": bs, "volume": volume, "position": ticket,
+            "type": self.mt5.ORDER_TYPE_SELL if is_buy else self.mt5.ORDER_TYPE_BUY,
+            "price": bid if is_buy else ask, "deviation": self.cfg.mt5.deviation_points,
+            "magic": self.cfg.mt5.magic, "comment": "partial", "type_time": self.mt5.ORDER_TIME_GTC,
+            "type_filling": self._filling(bs)})
+
     def close_position(self, ticket):
         p = self.position(ticket)
         if p is None:
@@ -208,7 +226,7 @@ class MT5Broker(Broker):  # pragma: no cover - needs a live terminal
         return ClosedTrade(
             ticket=ticket, symbol=self._unsym(first.symbol),
             direction=Direction.BUY if first.type == self.mt5.DEAL_TYPE_BUY else Direction.SELL,
-            volume=first.volume, entry_price=first.price, exit_price=last.price,
+            volume=sum(d.volume for d in ins), entry_price=first.price, exit_price=last.price,
             open_time=datetime.fromtimestamp(first.time, tz=timezone.utc).replace(tzinfo=None),
             close_time=datetime.fromtimestamp(last.time, tz=timezone.utc).replace(tzinfo=None),
             profit=net, close_reason=reason)

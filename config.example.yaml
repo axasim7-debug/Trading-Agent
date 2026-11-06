@@ -16,6 +16,10 @@ risk:
   require_take_profit: false
   max_spread_to_stop_ratio: 0.2
   max_trades_per_day: 10
+  max_currency_exposure_pct: 2.0     # net risk per currency across correlated trades
+  news_blackout_minutes_before: 30
+  news_blackout_minutes_after: 15
+  news_blackout_min_impact: High
 
 agent:
   model: claude-opus-5-5
@@ -35,6 +39,20 @@ backtest:
   initial_balance: 10000
   hide_dates: true
   max_cycles: null
+
+watchdog:
+  poll_seconds: 10
+  max_wakes_per_hour: 3              # protects your subscription usage
+  close_all_on_daily_loss: false
+  default_management: {break_even_at_r: 1.0, partial_at_r: null, trail_atr_mult: null, time_stop_hours: null}
+  # wake_command: [powershell, -NoProfile, -ExecutionPolicy, Bypass, -File, scripts\run_routine.ps1, -Routine, trade-cycle, -Context, "{context}"]
+
+research:
+  stats_path: cache/edge_stats.json
+  max_hold_hours: 72
+  oos_fraction: 0.3                  # last 30% of history = out-of-sample
+  min_trades: 30
+  min_oos_trades: 15
 
 mt5:
   login: null                   # or env MT5_LOGIN

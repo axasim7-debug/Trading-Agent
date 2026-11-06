@@ -44,6 +44,9 @@ class Broker(ABC):
     @abstractmethod
     def close_position(self, ticket: int) -> OrderResult: ...
 
+    def close_partial(self, ticket: int, volume: float) -> OrderResult:
+        return OrderResult(False, message="partial close not supported by this broker")
+
     @abstractmethod
     def closed_trade(self, ticket: int) -> ClosedTrade | None:
         """Details of a position that is no longer open, or None if still open/unknown."""

@@ -16,6 +16,7 @@ from .journal import Journal
 from .market import fmt_time
 from .risk import RiskManager
 from .stats import format_report, performance
+from .watchdog import Watchdog
 
 log = logging.getLogger(__name__)
 STOP_FILE = Path("STOP")  # create this file to stop a live session gracefully
@@ -34,7 +35,11 @@ class Session:
         cfg_dump = asdict(cfg)
         cfg_dump["mt5"].pop("password", None)
         self.run_id = journal.start_run(mode, agent_kind, label, cfg_dump)
-        self.executor = ToolExecutor(broker, self.risk, journal, self.run_id, cfg.watchlist, self.hide_dates)
+        self.executor = ToolExecutor(broker, self.risk, journal, self.run_id, cfg.watchlist, self.hide_dates,
+                                     default_management=cfg.watchdog.default_management,
+                                     stats_path=cfg.research.stats_path)
+        # The same deterministic management/alerts as live, without waking anyone.
+        self.watchdog = Watchdog(broker, journal, self.run_id, self.risk, cfg.watchdog, wake=None)
         self.agent = agent_factory(self.executor) if agent_factory else None
         self.cycles = 0
         self._last_day: date | None = None
@@ -92,7 +97,7 @@ class Session:
                                {"rounds": res.rounds, "usage": res.usage})
 
     def _on_new_bar(self) -> None:
-        self.sync_closed()
+        self.watchdog.tick()
         today = self.broker.now().date()
         if self._last_day is not None and today != self._last_day:
             a = self.broker.account()

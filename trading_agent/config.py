@@ -75,6 +75,29 @@ class MT5Config:
 
 
 @dataclass
+class WatchdogConfig:
+    poll_seconds: int = 10
+    max_wakes_per_hour: int = 3
+    close_all_on_daily_loss: bool = False
+    # Command that wakes the agent when an alert triggers ({context} is replaced). None = never wake.
+    wake_command: list[str] | None = field(default_factory=lambda: [
+        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\run_routine.ps1",
+        "-Routine", "trade-cycle", "-Context", "{context}"])
+    # Applied to every position unless the agent sets its own plan with set_trade_management.
+    default_management: dict = field(default_factory=lambda: {
+        "break_even_at_r": 1.0, "partial_at_r": None, "trail_atr_mult": None, "time_stop_hours": None})
+
+
+@dataclass
+class ResearchConfig:
+    stats_path: str = "cache/edge_stats.json"
+    max_hold_hours: int = 72
+    oos_fraction: float = 0.3          # last 30% of the history is out-of-sample
+    min_trades: int = 30
+    min_oos_trades: int = 15
+
+
+@dataclass
 class Config:
     watchlist: list[str] = field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"])
     decision_timeframe: str = "H1"
@@ -84,6 +107,8 @@ class Config:
     agent: AgentConfig = field(default_factory=AgentConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     mt5: MT5Config = field(default_factory=MT5Config)
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
     symbols: dict[str, SymbolSpec] = field(default_factory=dict)
 
     def spec(self, symbol: str) -> SymbolSpec:
@@ -116,6 +141,8 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         agent=_fill(AgentConfig, raw.get("agent")),
         backtest=_fill(BacktestConfig, raw.get("backtest")),
         mt5=_fill(MT5Config, raw.get("mt5")),
+        watchdog=_fill(WatchdogConfig, raw.get("watchdog")),
+        research=_fill(ResearchConfig, raw.get("research")),
     )
     for name, spec in (raw.get("symbols") or {}).items():
         merged = {**DEFAULT_SYMBOLS.get(name, {}), **(spec or {})}

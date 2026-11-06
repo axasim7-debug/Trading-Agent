@@ -6,10 +6,15 @@ from typing import Any
 
 import pandas as pd
 
+from datetime import timedelta
+
+from .. import management as mg
 from ..broker.base import Broker
 from ..journal import Journal
 from ..market import candles_text, fmt_time, market_overview
 from ..models import TIMEFRAMES, Direction
+from ..playbook import scan_now
+from ..research import edge_card, load_stats
 from ..risk import RiskManager
 
 TF_ENUM = ["M15", "H1", "H4", "D1"]
@@ -196,8 +201,11 @@ class ToolError(Exception):
 
 class ToolExecutor:
     def __init__(self, broker: Broker, risk: RiskManager, journal: Journal, run_id: int,
-                 watchlist: list[str], hide_dates: bool, calendar=None):
+                 watchlist: list[str], hide_dates: bool, calendar=None,
+                 default_management: dict | None = None, stats_path: str | None = None):
         self.calendar = calendar
+        self.default_management = default_management
+        self.stats_path = stats_path
         self.broker = broker
         self.risk = risk
         self.journal = journal
@@ -348,6 +356,69 @@ class ToolExecutor:
         return self.journal.events(self.run_id, ("cycle", "daily_prep", "review", "weekly_review"),
                                    int(limit)) or "No previous routines logged."
 
+    # ---- watchdog: alerts and trade management --------------------------------------------
+    def t_set_alert(self, symbol, condition, price, note, expires_hours=24):
+        symbol = self._symbol(symbol)
+        if condition not in ("above", "below"):
+            raise ToolError("condition must be 'above' or 'below'")
+        bid, _ = self.broker.quote(symbol)
+        price = float(price)
+        if (condition == "above" and bid >= price) or (condition == "below" and bid <= price):
+            raise ToolError(f"Alert would trigger immediately (bid {bid}).")
+        now = self.broker.now()
+        aid = self.journal.add_alert(self.run_id, symbol, condition, price, str(note)[:300], now,
+                                     now + timedelta(hours=float(expires_hours)))
+        return {"alert_id": aid, "symbol": symbol, "condition": condition, "price": price,
+                "note": "The watchdog will wake you when it triggers."}
+
+    def t_list_alerts(self):
+        rows = [a for a in self.journal.alerts(self.run_id) if a["status"] in ("active", "triggered")]
+        return [{k: a[k] for k in ("id", "symbol", "condition", "price", "note", "status", "expires",
+                                   "triggered_at", "trigger_price")} for a in rows] or "No active or triggered alerts."
+
+    def t_dismiss_alert(self, alert_id):
+        self.journal.set_alert_status(int(alert_id), "dismissed")
+        return "Dismissed."
+
+    def t_set_trade_management(self, ticket, **params):
+        p = self.broker.position(int(ticket))
+        if p is None:
+            raise ToolError(f"No open position with ticket {ticket}")
+        key = mg.plan_key(p.ticket)
+        raw = self.journal.get_kv(self.run_id, key)
+        plan = mg.ManagementPlan.from_dict(raw) if raw else mg.default_plan(p, self.default_management)
+        allowed = {"break_even_at_r", "partial_at_r", "partial_fraction", "trail_atr_mult",
+                   "trail_timeframe", "trail_after_r", "time_stop_hours"}
+        for k, v in params.items():
+            if k not in allowed:
+                raise ToolError(f"Unknown management field {k}")
+            setattr(plan, k, v)
+        if plan.partial_fraction is not None and not (0 < plan.partial_fraction < 1):
+            raise ToolError("partial_fraction must be between 0 and 1")
+        if plan.trail_timeframe not in TF_ENUM:
+            raise ToolError(f"trail_timeframe must be one of {TF_ENUM}")
+        self.journal.set_kv(self.run_id, key, plan.to_dict())
+        return {"ticket": p.ticket, "plan": plan.to_dict()}
+
+    # ---- playbook research -----------------------------------------------------------------
+    def t_scan_setups(self, symbols=None):
+        syms = [self._symbol(s) for s in symbols] if symbols else self.watchlist
+        stats = load_stats(self.stats_path) if self.stats_path else None
+        found = scan_now(self.broker, syms)
+        for s in found:
+            s["bar_time"] = self._t(s["bar_time"])
+            s["edge"] = edge_card(stats, s["setup"], s["symbol"], s["session"], s["regime"])
+        return found or "No playbook setup fired on the last completed H1 bar."
+
+    def t_get_edge_stats(self, setup=None, symbol=None):
+        stats = load_stats(self.stats_path) if self.stats_path else None
+        if not stats:
+            return "No research yet. Run `python -m trading_agent research` on historical data."
+        rows = [r for r in stats["table"] if (not setup or r.get("setup") == setup)
+                and (not symbol or r.get("symbol") in (None, str(symbol).upper()))]
+        return {"data": f"{stats['data_from'][:10]} -> {stats['data_to'][:10]} (OOS from {stats['oos_from'][:10]})",
+                "rules": stats["rules"], "rows": rows[:60]}
+
     # ---- trading tools --------------------------------------------------------------------
     def t_open_trade(self, symbol, direction, stop_loss, risk_percent, setup, reasoning, take_profit=None):
         symbol = self._symbol(symbol)
@@ -372,6 +443,10 @@ class ToolExecutor:
         self.journal.record_open(self.run_id, res.ticket, symbol, d.value, res.volume or plan.volume,
                                  res.price or plan.entry_estimate, float(stop_loss), take_profit,
                                  plan.risk_amount, now, setup, reasoning)
+        pos = self.broker.position(res.ticket)
+        if pos is not None:
+            mplan = mg.default_plan(pos, self.default_management)
+            self.journal.set_kv(self.run_id, mg.plan_key(res.ticket), mplan.to_dict())
         spec = self.broker.symbol_spec(symbol)
         return {"status": "filled", "ticket": res.ticket, "price": res.price, "volume": res.volume,
                 "money_at_risk": round(plan.risk_amount, 2),

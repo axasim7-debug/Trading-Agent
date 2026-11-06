@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS notes (
     run_id INTEGER, time TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS equity (
     run_id INTEGER, time TEXT, balance REAL, equity REAL);
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, symbol TEXT, condition TEXT, price REAL,
+    note TEXT, created TEXT, expires TEXT, status TEXT, triggered_at TEXT, trigger_price REAL);
 CREATE TABLE IF NOT EXISTS kv (
     run_id INTEGER, key TEXT, value TEXT, updated TEXT, PRIMARY KEY (run_id, key));
 """
@@ -33,7 +36,7 @@ def _ts(t: datetime) -> str:
 
 class Journal:
     def __init__(self, path: str = "journal.sqlite"):
-        self.db = sqlite3.connect(path, check_same_thread=False)  # callers serialise access
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=30)  # callers serialise access
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
 
@@ -61,6 +64,28 @@ class Journal:
         self.db.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?,?)",
                         (run_id, key, json.dumps(value, default=str, ensure_ascii=False),
                          datetime.now().isoformat(timespec="seconds")))
+        self.db.commit()
+
+    # ---- price alerts (set by the agent, checked by the watchdog) ----------------------------
+    def add_alert(self, run_id, symbol, condition, price, note, created, expires) -> int:
+        cur = self.db.execute(
+            "INSERT INTO alerts (run_id, symbol, condition, price, note, created, expires, status)"
+            " VALUES (?,?,?,?,?,?,?, 'active')",
+            (run_id, symbol, condition, price, note, _ts(created), _ts(expires)))
+        self.db.commit()
+        return cur.lastrowid
+
+    def alerts(self, run_id, status: str | None = None) -> list[dict]:
+        q, params = "SELECT * FROM alerts WHERE run_id=?", [run_id]
+        if status:
+            q += " AND status=?"
+            params.append(status)
+        return [dict(r) for r in self.db.execute(q + " ORDER BY id", params)]
+
+    def set_alert_status(self, alert_id, status, triggered_at=None, price=None):
+        self.db.execute("UPDATE alerts SET status=?, triggered_at=COALESCE(?, triggered_at),"
+                        " trigger_price=COALESCE(?, trigger_price) WHERE id=?",
+                        (status, _ts(triggered_at) if triggered_at else None, price, alert_id))
         self.db.commit()
 
     def trades_opened_on(self, run_id, day: str) -> int:
